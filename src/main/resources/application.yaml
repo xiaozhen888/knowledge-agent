@@ -1,0 +1,26 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: knowledge-agent
+
+  # Redis配置
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  # RabbitMQ配置
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+
+# 大模型API配置
+langchain4j:
+  openai:
+    api-key: ${DEEPSEEK_API_KEY}
+    base-url: https://api.deepseek.com/v1
+    model-name: deepseek-chat
