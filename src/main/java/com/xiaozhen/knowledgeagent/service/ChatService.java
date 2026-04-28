@@ -90,19 +90,25 @@ public class ChatService {
         }
 
         String prompt = """
-                你是一个知识库助手。请参考对话历史和参考内容回答用户问题。
-                请用自然的口语化方式回答。
-                不要使用Markdown格式（不要用**加粗**、不要用-列表、不要用#标题。
-                
-                %s
-                【参考内容】
-                %s
-                
-                【用户当前问题】
-                %s
-                
-                【你的回答】
-                """.formatted(historyPrompt.toString(), context.toString(), question);
+                        你是一个专业、清晰的知识库助手。
+                        
+                        回答规则：
+                        1. 默认使用分点形式回答，用"1."、"2."、"3."编号，简洁明了。
+                        2. 如果用户明确要求"用一句话回答"或"用一段话总结"，则用完整的一段话来回复。
+                        3. 回答只基于参考内容，不要编造信息。
+                        4. 如果参考内容不足以回答问题，请如实告知。
+                        5. 【重要】不要使用任何Markdown格式：不要用**加粗**、不要用*斜体*、不要用-或*列表符号、不要用#标题。直接输出纯文本。
+                        
+                        %s
+                        【参考内容】
+                        %s
+                        
+                        【用户当前问题】
+                        %s
+                        
+                        【你的回答】
+                        """
+                .formatted(historyPrompt.toString(), context.toString(), question);
 
         String answer = model.generate(prompt);
 
