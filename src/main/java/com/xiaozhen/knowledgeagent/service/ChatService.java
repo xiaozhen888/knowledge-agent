@@ -11,11 +11,9 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
-import java.util.Map;
-import java.util.HashMap;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
@@ -112,6 +110,23 @@ public class ChatService {
 
         String answer = model.generate(prompt);
 
+        // === 拼接溯源信息 ===
+        StringBuilder sourceInfo = new StringBuilder();
+        sourceInfo.append("\n\n---\n📚 **参考来源**\n");
+        Set<String> questionWords = tokenizeForHighlight(question);
+        for (int i = 0; i < relevantChunks.size(); i++) {
+            sourceInfo.append("\n**片段").append(i + 1).append("：** ");
+            // 关键词高亮：把chunk中的关键词用【】包起来
+            String highlighted = highlightKeywords(relevantChunks.get(i), questionWords);
+            // 截取前120字做预览
+            if (highlighted.length() > 120) {
+                highlighted = highlighted.substring(0, 120) + "...";
+            }
+            sourceInfo.append(highlighted);
+        }
+
+        String finalAnswer = answer + sourceInfo.toString();
+
         // 4. 保存本轮对话
         Map<String, String> turn = new HashMap<>();
         turn.put("user", question);
@@ -126,11 +141,37 @@ public class ChatService {
             // 序列化失败不影响主流程
         }
 
-        return answer;
+        return finalAnswer;
     }
 
     // 保留旧的ask方法兼容
     public String ask(String question) {
         return ask("default-session", question);
+    }
+
+    /**
+     * 从问题中提取关键词（用于高亮）
+     */
+    private Set<String> tokenizeForHighlight(String question) {
+        String[] words = question.split("[，。！？；、\\s,.!?;:：\n]+");
+        Set<String> result = new HashSet<>();
+        for (String word : words) {
+            if (word.trim().length() >= 2) {
+                result.add(word.trim());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 在文本中高亮关键词（用【】包裹）
+     */
+    private String highlightKeywords(String text, Set<String> keywords) {
+        String result = text;
+        for (String keyword : keywords) {
+            // 忽略大小写替换
+            result = result.replaceAll("(?i)" + Pattern.quote(keyword), "【" + keyword + "】");
+        }
+        return result;
     }
 }

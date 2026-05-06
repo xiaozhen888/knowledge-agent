@@ -29,6 +29,11 @@ spring:
       ddl-auto: none
     show-sql: true
 
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
 # 大模型API配置
 langchain4j:
   openai:

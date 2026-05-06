@@ -43,6 +43,59 @@
 
         .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #f3f3f3; border-top: 2px solid #4f46e5; border-radius: 50%; animation: spin 1s linear infinite; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        mark {
+            background-color: #fef08a;
+            color: #000;
+            padding: 1px 3px;
+            border-radius: 2px;
+        }
+
+        .source-box {
+            margin-top: 12px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            overflow: hidden;
+            max-width: 100%;
+        }
+        .source-header {
+            background: #f3f4f6;
+            padding: 8px 12px;
+            font-size: 13px;
+            font-weight: bold;
+            color: #374151;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .source-tabs {
+            display: flex;
+            gap: 4px;
+            padding: 8px 12px;
+            background: #fafafa;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .source-tab {
+            padding: 4px 12px;
+            border: 1px solid #d1d5db;
+            background: white;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            color: #6b7280;
+        }
+        .source-tab.active {
+            background: #4f46e5;
+            color: white;
+            border-color: #4f46e5;
+        }
+        .source-panel {
+            padding: 12px;
+            font-size: 13px;
+            color: #333;
+            line-height: 1.8;
+            background: #fffef5;
+            max-height: 200px;
+            overflow-y: auto;
+        }
     </style>
 </head>
 <body>
@@ -150,12 +203,63 @@
         const messagesDiv = document.getElementById('messages');
         const msgDiv = document.createElement('div');
         msgDiv.className = 'message ' + role;
+
+        // 分离回答和参考来源
+        let mainAnswer = content;
+        let sourcePart = '';
+        const separatorIndex = content.indexOf('\n\n---\n📚 **参考来源**\n');
+
+        if (separatorIndex !== -1) {
+            mainAnswer = content.substring(0, separatorIndex);
+            sourcePart = content.substring(separatorIndex);
+        }
+
+        // 渲染高亮：【xxx】→ <mark>xxx</mark>
+        mainAnswer = mainAnswer.replace(/【(.+?)】/g, '<mark>$1</mark>');
+
+        // 处理参考来源
+        let sourceHtml = '';
+        if (sourcePart) {
+            let sourceText = sourcePart.replace('📚 **参考来源**\n', '');
+            const segments = sourceText.split(/\*\*片段\d+：\*\*/).filter(s => s.trim());
+            const titles = sourceText.match(/\*\*片段\d+：\*\*/g) || [];
+
+            sourceHtml = '<div class="source-box">';
+            sourceHtml += '<div class="source-header">📚 参考来源</div>';
+            sourceHtml += '<div class="source-tabs">';
+
+            for (let i = 0; i < segments.length; i++) {
+                sourceHtml += `<button class="source-tab ${i === 0 ? 'active' : ''}" onclick="switchSource(this, 'source-${msgDiv._id}-${i}')">片段${i + 1}</button>`;
+            }
+            sourceHtml += '</div>';
+
+            for (let i = 0; i < segments.length; i++) {
+                let segment = segments[i].trim();
+                segment = segment.replace(/【(.+?)】/g, '<mark>$1</mark>');
+                sourceHtml += `<div id="source-${msgDiv._id}-${i}" class="source-panel" style="display:${i === 0 ? 'block' : 'none'}">${segment.replace(/\n/g, '<br>')}</div>`;
+            }
+            sourceHtml += '</div>';
+        }
+
+        const msgId = 'msg-' + Date.now();
+        msgDiv._id = msgId;
+
         msgDiv.innerHTML = `
-                <span class="label">${role === 'user' ? '你' : '助手'}</span>
-                <div class="bubble">${escapeHtml(content)}</div>
-            `;
+        <span class="label">${role === 'user' ? '你' : '助手'}</span>
+        <div class="bubble">${mainAnswer.replace(/\n/g, '<br>')}</div>
+        ${sourceHtml}
+    `;
         messagesDiv.appendChild(msgDiv);
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    // 切换参考片段
+    function switchSource(btn, panelId) {
+        const box = btn.closest('.source-box');
+        box.querySelectorAll('.source-tab').forEach(t => t.classList.remove('active'));
+        btn.classList.add('active');
+        box.querySelectorAll('.source-panel').forEach(p => p.style.display = 'none');
+        document.getElementById(panelId).style.display = 'block';
     }
 
     function addLoadingMessage() {
