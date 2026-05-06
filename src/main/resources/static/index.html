@@ -96,6 +96,23 @@
             max-height: 200px;
             overflow-y: auto;
         }
+
+        .feedback-btns {
+            display: flex;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .fb-btn {
+            background: none;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .fb-btn:hover {
+            background: #f3f4f6;
+        }
     </style>
 </head>
 <body>
@@ -165,18 +182,15 @@
     async function sendMessage() {
         const input = document.getElementById('questionInput');
         const sendBtn = document.getElementById('sendBtn');
-        const messagesDiv = document.getElementById('messages');
         const question = input.value.trim();
 
         if (!question) return;
 
-        // 显示用户消息
         addMessage('user', question);
         input.value = '';
         sendBtn.disabled = true;
         sendBtn.textContent = '思考中...';
 
-        // 显示加载动画
         const loadingId = addLoadingMessage();
 
         try {
@@ -186,8 +200,6 @@
                 body: JSON.stringify({ sessionId: sessionId, question: question })
             });
             const answer = await res.text();
-
-            // 移除加载动画，显示回答
             removeMessage(loadingId);
             addMessage('assistant', answer);
         } catch (e) {
@@ -204,7 +216,6 @@
         const msgDiv = document.createElement('div');
         msgDiv.className = 'message ' + role;
 
-        // 分离回答和参考来源
         let mainAnswer = content;
         let sourcePart = '';
         const separatorIndex = content.indexOf('\n\n---\n📚 **参考来源**\n');
@@ -214,10 +225,8 @@
             sourcePart = content.substring(separatorIndex);
         }
 
-        // 渲染高亮：【xxx】→ <mark>xxx</mark>
         mainAnswer = mainAnswer.replace(/【(.+?)】/g, '<mark>$1</mark>');
 
-        // 处理参考来源
         let sourceHtml = '';
         if (sourcePart) {
             let sourceText = sourcePart.replace('📚 **参考来源**\n', '');
@@ -245,15 +254,44 @@
         msgDiv._id = msgId;
 
         msgDiv.innerHTML = `
-        <span class="label">${role === 'user' ? '你' : '助手'}</span>
-        <div class="bubble">${mainAnswer.replace(/\n/g, '<br>')}</div>
-        ${sourceHtml}
-    `;
+            <span class="label">${role === 'user' ? '你' : '助手'}</span>
+            <div class="bubble">${mainAnswer.replace(/\n/g, '<br>')}</div>
+            ${sourceHtml}
+        `;
+
+        if (role === 'assistant' && !content.startsWith('你好')) {
+            const allMessages = messagesDiv.querySelectorAll('.message.user');
+            const lastUserMsg = allMessages[allMessages.length - 1];
+            const question = lastUserMsg ? lastUserMsg.querySelector('.bubble').textContent : '';
+
+            const btnDiv = document.createElement('div');
+            btnDiv.className = 'feedback-btns';
+
+            const likeBtn = document.createElement('button');
+            likeBtn.className = 'fb-btn';
+            likeBtn.title = '有帮助';
+            likeBtn.textContent = '👍';
+            likeBtn.onclick = function() {
+                submitFeedback(sessionId, question, mainAnswer, 'like', this);
+            };
+
+            const dislikeBtn = document.createElement('button');
+            dislikeBtn.className = 'fb-btn';
+            dislikeBtn.title = '没帮助';
+            dislikeBtn.textContent = '👎';
+            dislikeBtn.onclick = function() {
+                submitFeedback(sessionId, question, mainAnswer, 'dislike', this);
+            };
+
+            btnDiv.appendChild(likeBtn);
+            btnDiv.appendChild(dislikeBtn);
+            msgDiv.appendChild(btnDiv);
+        }
+
         messagesDiv.appendChild(msgDiv);
         messagesDiv.scrollTop = messagesDiv.scrollHeight;
     }
 
-    // 切换参考片段
     function switchSource(btn, panelId) {
         const box = btn.closest('.source-box');
         box.querySelectorAll('.source-tab').forEach(t => t.classList.remove('active'));
@@ -282,6 +320,25 @@
         const div = document.createElement('div');
         div.textContent = text;
         return div.innerHTML.replace(/\n/g, '<br>');
+    }
+
+    function escapeJs(str) {
+        return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n');
+    }
+
+    async function submitFeedback(sessionId, question, answer, rating, btn) {
+        try {
+            await fetch('/api/feedback', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: sessionId, question: question, answer: answer, rating: rating })
+            });
+            btn.textContent = '✅';
+            btn.disabled = true;
+            btn.parentElement.querySelectorAll('.fb-btn').forEach(b => b.disabled = true);
+        } catch (e) {
+            alert('反馈提交失败');
+        }
     }
 </script>
 </body>

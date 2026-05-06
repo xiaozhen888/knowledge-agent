@@ -87,6 +87,24 @@ public class ChatService {
             historyPrompt.append("\n");
         }
 
+        // === 差评反馈逻辑 ===
+        String dislikeKey = "feedback:dislike:" + sessionId;
+        String dislikeFeedback = redisTemplate.opsForValue().get(dislikeKey);
+        if (dislikeFeedback != null) {
+            // 1. 提示AI要改进回答
+            historyPrompt.append("【系统提示】\n").append(dislikeFeedback).append("\n\n");
+
+            // 2. 重新检索更多片段（例如取 Top-6），避免无话可说
+            relevantChunks = vectorService.searchRelevant(allChunks, question, 6);
+            context = new StringBuilder();
+            for (int i = 0; i < relevantChunks.size(); i++) {
+                context.append("【参考片段").append(i + 1).append("】\n");
+                context.append(relevantChunks.get(i)).append("\n\n");
+            }
+
+            redisTemplate.delete(dislikeKey);
+        }
+
         String prompt = """
                         你是一个专业、清晰的知识库助手。
                         
