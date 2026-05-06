@@ -18,6 +18,17 @@ spring:
     username: guest
     password: guest
 
+  # MySQL配置
+  datasource:
+    url: jdbc:mysql://mysql:3306/knowledge_agent?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
+    username: root
+    password: mysql666@
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: true
+
 # 大模型API配置
 langchain4j:
   openai:
