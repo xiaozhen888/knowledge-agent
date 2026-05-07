@@ -7,6 +7,7 @@ import com.xiaozhen.knowledgeagent.repository.DocumentRepository;
 import lombok.RequiredArgsConstructor;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
@@ -30,16 +31,11 @@ public class DocumentConsumer {
         try {
             updateStatus(docId, "PROCESSING");
 
-            // 用 PDDocument.load() 而不是 Loader.load()
-            PDDocument document = PDDocument.load(new ByteArrayInputStream(message.getContent()));
-            PDFTextStripper stripper = new PDFTextStripper();
-            String text = stripper.getText(document);
-            document.close();
+            String text = extractText(message.getContent(), message.getFileName());
 
             List<String> chunks = splitText(text, 500, 100);
             chatService.storeChunks(chunks);
 
-            // 更新MySQL：状态、字数、切片数
             Document doc = documentRepository.findById(docId).orElse(null);
             if (doc != null) {
                 doc.setStatus("SUCCESS");
@@ -54,14 +50,40 @@ public class DocumentConsumer {
         } catch (Exception e) {
             e.printStackTrace();
             updateStatus(docId, "FAILED: " + e.getMessage());
-
-            // 更新MySQL：标记失败
-            Document doc = documentRepository.findById(docId).orElse(null);
-            if (doc != null) {
-                doc.setStatus("FAILED: " + e.getMessage());
-                documentRepository.save(doc);
-            }
         }
+    }
+
+    /**
+     * 根据文件名后缀选择解析器
+     */
+    private String extractText(byte[] content, String fileName) throws Exception {
+        String lowerName = fileName.toLowerCase();
+
+        if (lowerName.endsWith(".pdf")) {
+            return extractPdfText(content);
+        } else if (lowerName.endsWith(".docx")) {
+            return extractDocxText(content);
+        } else if (lowerName.endsWith(".md") || lowerName.endsWith(".txt")) {
+            return new String(content);
+        } else {
+            throw new IllegalArgumentException("不支持的文件格式: " + fileName);
+        }
+    }
+
+    private String extractPdfText(byte[] content) throws Exception {
+        PDDocument document = PDDocument.load(new ByteArrayInputStream(content));
+        PDFTextStripper stripper = new PDFTextStripper();
+        String text = stripper.getText(document);
+        document.close();
+        return text;
+    }
+
+    private String extractDocxText(byte[] content) throws Exception {
+        XWPFDocument document = new XWPFDocument(new ByteArrayInputStream(content));
+        StringBuilder sb = new StringBuilder();
+        document.getParagraphs().forEach(p -> sb.append(p.getText()).append("\n"));
+        document.close();
+        return sb.toString();
     }
 
     private void updateStatus(String docId, String status) {
