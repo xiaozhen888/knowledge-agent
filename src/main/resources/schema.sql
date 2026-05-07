@@ -21,3 +21,13 @@ CREATE TABLE IF NOT EXISTS feedback (
                                         rating VARCHAR(10) NOT NULL COMMENT '评价: like 或 dislike',
                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '反馈时间'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户反馈记录表';
+
+-- 会话历史表
+CREATE TABLE IF NOT EXISTS chat_history (
+                                            id BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+                                            session_id VARCHAR(50) NOT NULL COMMENT '会话ID',
+                                            question TEXT NOT NULL COMMENT '用户问题',
+                                            answer TEXT NOT NULL COMMENT 'AI回答',
+                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                                            INDEX idx_session_id (session_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话历史记录表';

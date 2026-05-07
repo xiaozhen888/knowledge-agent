@@ -3,7 +3,9 @@ package com.xiaozhen.knowledgeagent.service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xiaozhen.knowledgeagent.model.Document;
+import com.xiaozhen.knowledgeagent.model.ChatHistory;
 import com.xiaozhen.knowledgeagent.repository.DocumentRepository;
+import com.xiaozhen.knowledgeagent.repository.ChatHistoryRepository;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import jakarta.annotation.PostConstruct;
@@ -23,8 +25,9 @@ public class ChatService {
 
     private final VectorService vectorService;
     private final RedisTemplate<String, String> redisTemplate;
-    private final ObjectMapper objectMapper = new ObjectMapper();
     private final DocumentRepository documentRepository;
+    private final ChatHistoryRepository chatHistoryRepository;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Value("${langchain4j.openai.api-key}")
     private String apiKey;
@@ -47,9 +50,8 @@ public class ChatService {
                 .build();
     }
 
-    // 修改后的ask方法，支持会话历史
     public String ask(String sessionId, String question) {
-        // 1. 从数据库读取激活且未删除的文档ID
+        // 1. 从数据库读取激活且未删除的文档切片
         List<Document> activeDocs = documentRepository.findByActiveTrueAndDeletedFalse();
         List<String> allChunks = new ArrayList<>();
         for (Document doc : activeDocs) {
@@ -76,15 +78,31 @@ public class ChatService {
             context.append(relevantChunks.get(i)).append("\n\n");
         }
 
-        // 3. 从Redis读取历史（存储为JSON字符串）
+        // 3. 读历史：优先Redis，未命中查MySQL并回填
         String historyKey = "chat:history:" + sessionId;
         String historyJson = redisTemplate.opsForValue().get(historyKey);
         List<Map<String, String>> history = new ArrayList<>();
+
         if (historyJson != null) {
             try {
                 history = objectMapper.readValue(historyJson, new TypeReference<List<Map<String, String>>>() {});
             } catch (Exception e) {
-                // 解析失败就用空历史
+                history = new ArrayList<>();
+            }
+        } else {
+            List<ChatHistory> dbHistories = chatHistoryRepository.findBySessionIdOrderByCreatedAtAsc(sessionId);
+            if (!dbHistories.isEmpty()) {
+                for (ChatHistory h : dbHistories) {
+                    Map<String, String> turn = new HashMap<>();
+                    turn.put("user", h.getQuestion());
+                    turn.put("assistant", h.getAnswer());
+                    history.add(turn);
+                }
+                try {
+                    redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
+                } catch (Exception e) {
+                    // 回填失败不影响
+                }
             }
         }
 
@@ -103,7 +121,6 @@ public class ChatService {
         String dislikeKey = "feedback:dislike:" + sessionId;
         String dislikeFeedback = redisTemplate.opsForValue().get(dislikeKey);
         if (dislikeFeedback != null) {
-            // 提示AI要改进回答
             historyPrompt.append("【系统提示】\n").append(dislikeFeedback).append("\n\n");
             redisTemplate.delete(dislikeKey);
         }
@@ -146,7 +163,10 @@ public class ChatService {
 
         String finalAnswer = answer + sourceInfo.toString();
 
-        // 5. 保存本轮对话
+        // 5. 双写对话历史：MySQL + Redis
+        ChatHistory ch = new ChatHistory(sessionId, question, answer);
+        chatHistoryRepository.save(ch);
+
         Map<String, String> turn = new HashMap<>();
         turn.put("user", question);
         turn.put("assistant", answer);
@@ -157,20 +177,16 @@ public class ChatService {
         try {
             redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
         } catch (Exception e) {
-            // 序列化失败不影响主流程
+            // Redis写失败不影响，下次读时会从MySQL回填
         }
 
         return finalAnswer;
     }
 
-    // 保留旧的ask方法兼容
     public String ask(String question) {
         return ask("default-session", question);
     }
 
-    /**
-     * 从问题中提取关键词（用于高亮）
-     */
     private Set<String> tokenizeForHighlight(String question) {
         String[] words = question.split("[，。！？；、\\s,.!?;:：\n]+");
         Set<String> result = new HashSet<>();
@@ -182,9 +198,6 @@ public class ChatService {
         return result;
     }
 
-    /**
-     * 在文本中高亮关键词（用【】包裹）
-     */
     private String highlightKeywords(String text, Set<String> keywords) {
         String result = text;
         for (String keyword : keywords) {

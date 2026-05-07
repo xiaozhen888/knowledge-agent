@@ -12,6 +12,9 @@ import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.io.ByteArrayInputStream;
 import java.time.Duration;
@@ -27,18 +30,22 @@ public class DocumentConsumer {
     private final DocumentRepository documentRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    @Transactional
     @RabbitListener(queues = RabbitMQConfig.QUEUE_DOCUMENT)
     public void handleDocument(DocumentMessage message) {
         String docId = message.getDocId();
         try {
+            // 先写Redis
             updateStatus(docId, "PROCESSING");
 
+            // 解析文档
             String text = extractText(message.getContent(), message.getFileName());
-
             List<String> chunks = splitText(text, 500, 100);
-            String chunksKey = "chunks:" + docId;
-            redisTemplate.opsForValue().set(chunksKey, objectMapper.writeValueAsString(chunks), 24, TimeUnit.HOURS);
 
+            // 切片存Redis
+            redisTemplate.opsForValue().set("chunks:" + docId, objectMapper.writeValueAsString(chunks), 24, TimeUnit.HOURS);
+
+            // 写MySQL（事务内）
             Document doc = documentRepository.findById(docId).orElse(null);
             if (doc != null) {
                 doc.setStatus("SUCCESS");
@@ -47,12 +54,23 @@ public class DocumentConsumer {
                 documentRepository.save(doc);
             }
 
-            updateStatus(docId, "SUCCESS");
-            System.out.println("文档 " + docId + " 处理完成，共 " + chunks.size() + " 个片段");
+            // 事务提交后再写Redis状态，保证一致性
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    updateStatus(docId, "SUCCESS");
+                    System.out.println("文档 " + docId + " 处理完成，共 " + chunks.size() + " 个片段");
+                }
+            });
 
         } catch (Exception e) {
             e.printStackTrace();
-            updateStatus(docId, "FAILED: " + e.getMessage());
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    updateStatus(docId, "FAILED: " + e.getMessage());
+                }
+            });
         }
     }
 

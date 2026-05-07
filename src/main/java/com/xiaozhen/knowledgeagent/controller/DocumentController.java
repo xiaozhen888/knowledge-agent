@@ -32,8 +32,14 @@ public class DocumentController {
 
     @GetMapping("/status/{docId}")
     public String getStatus(@PathVariable String docId) {
+        // 优先从Redis查
         String status = redisTemplate.opsForValue().get("doc:status:" + docId);
-        return status != null ? status : "未找到该文档";
+        if (status != null) {
+            return status;
+        }
+        // Redis没命中，兜底查MySQL
+        Document doc = documentRepository.findById(docId).orElse(null);
+        return doc != null ? doc.getStatus() : "未找到该文档";
     }
 
     // 正常文档列表（不含已删除）
