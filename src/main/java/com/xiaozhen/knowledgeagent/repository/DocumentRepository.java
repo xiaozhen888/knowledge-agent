@@ -9,5 +9,6 @@ import java.util.List;
 @Repository
 public interface DocumentRepository extends JpaRepository<Document, String> {
     List<Document> findByFileName(String fileName);
-    List<Document> findByActiveTrue();
+    List<Document> findByActiveTrueAndDeletedFalse();
+    List<Document> findByDeletedTrue();
 }

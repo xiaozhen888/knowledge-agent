@@ -136,7 +136,10 @@
     </div>
 
     <div class="doc-list">
-        <h4>📋 已上传文档</h4>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <h4>📋 已上传文档</h4>
+            <button onclick="loadTrash()" style="background:none;border:none;cursor:pointer;color:#6b7280;font-size:13px;">🗑️ 回收站</button>
+        </div>
         <div id="docList">加载中...</div>
     </div>
 
@@ -169,19 +172,20 @@
             const res = await fetch('/api/document/list');
             const docs = await res.json();
             const listDiv = document.getElementById('docList');
-            if (!docs || docs.length === 0) {
+            const activeDocs = docs.filter(d => !d.deleted);
+            if (activeDocs.length === 0) {
                 listDiv.innerHTML = '暂无文档';
                 return;
             }
-            listDiv.innerHTML = docs.map(d =>
+            listDiv.innerHTML = activeDocs.map(d =>
                 `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid #eee;">
-                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-                        <input type="checkbox" ${d.active ? 'checked' : ''} onchange="toggleDoc('${d.id}', this.checked)" />
-                        <span>📄 ${d.fileName} (${d.chunkCount || 0}个片段)</span>
-                        <span style="font-size:11px;color:#999;">${d.status}</span>
-                    </label>
-                    <button onclick="deleteDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#e53e3e;">删除</button>
-                </div>`
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" ${d.active ? 'checked' : ''} onchange="toggleDoc('${d.id}', this.checked)" />
+                    <span>📄 ${d.fileName} (${d.chunkCount || 0}个片段)</span>
+                    <span style="font-size:11px;color:#999;">${d.status}</span>
+                </label>
+                <button onclick="deleteDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#e53e3e;">删除</button>
+            </div>`
             ).join('');
         } catch (e) {
             document.getElementById('docList').textContent = '加载失败';
@@ -386,6 +390,40 @@
         } catch (e) {
             alert('反馈提交失败');
         }
+    }
+
+    async function loadTrash() {
+        try {
+            const res = await fetch('/api/document/trash');
+            const docs = await res.json();
+            const listDiv = document.getElementById('docList');
+            if (!docs || docs.length === 0) {
+                listDiv.innerHTML = '<div style="color:#999;">回收站为空</div><button onclick="loadDocList()" style="margin-top:8px;background:none;border:none;cursor:pointer;color:#4f46e5;">← 返回文档列表</button>';
+                return;
+            }
+            listDiv.innerHTML = docs.map(d =>
+                `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid #eee;">
+                <span>📄 ${d.fileName}</span>
+                <div style="display:flex;gap:8px;">
+                    <button onclick="restoreDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#4f46e5;">恢复</button>
+                    <button onclick="purgeDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#e53e3e;">彻底删除</button>
+                </div>
+            </div>`
+            ).join('') + '<button onclick="loadDocList()" style="margin-top:8px;background:none;border:none;cursor:pointer;color:#4f46e5;">← 返回文档列表</button>';
+        } catch (e) {
+            document.getElementById('docList').textContent = '加载失败';
+        }
+    }
+
+    async function restoreDoc(id) {
+        await fetch('/api/document/' + id + '/restore', { method: 'PUT' });
+        loadTrash();
+    }
+
+    async function purgeDoc(id) {
+        if (!confirm('确定彻底删除？此操作不可恢复。')) return;
+        await fetch('/api/document/' + id + '/purge', { method: 'DELETE' });
+        loadTrash();
     }
 </script>
 </body>

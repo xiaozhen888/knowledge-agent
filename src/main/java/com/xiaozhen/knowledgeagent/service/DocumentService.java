@@ -35,6 +35,7 @@ public class DocumentService {
             if (md5.equals(doc.getFileMd5())) {
                 // 文件已存在，直接激活并返回
                 doc.setActive(true);
+                doc.setDeleted(false);  // 从回收站恢复
                 documentRepository.save(doc);
                 return "该文档已存在（ID: " + doc.getId() + "），已重新激活，无需重复解析";
             }

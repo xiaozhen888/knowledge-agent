@@ -49,8 +49,8 @@ public class ChatService {
 
     // 修改后的ask方法，支持会话历史
     public String ask(String sessionId, String question) {
-        // 1. 从数据库读取激活的文档ID
-        List<Document> activeDocs = documentRepository.findByActiveTrue();
+        // 1. 从数据库读取激活且未删除的文档ID
+        List<Document> activeDocs = documentRepository.findByActiveTrueAndDeletedFalse();
         List<String> allChunks = new ArrayList<>();
         for (Document doc : activeDocs) {
             String json = redisTemplate.opsForValue().get("chunks:" + doc.getId());

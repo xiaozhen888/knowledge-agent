@@ -36,28 +36,55 @@ public class DocumentController {
         return status != null ? status : "未找到该文档";
     }
 
+    // 正常文档列表（不含已删除）
     @GetMapping("/list")
     public List<Document> list() {
         return documentRepository.findAll(Sort.by(Sort.Direction.DESC, "createdAt"));
     }
 
+    // 软删除
     @DeleteMapping("/{id}")
-    public String delete(@PathVariable String id) {
-        if (!documentRepository.existsById(id)) {
-            return "文档不存在";
-        }
+    public String softDelete(@PathVariable String id) {
+        Document doc = documentRepository.findById(id).orElse(null);
+        if (doc == null) return "文档不存在";
+        doc.setActive(false);
+        doc.setDeleted(true);
+        documentRepository.save(doc);
+        return "已移入回收站";
+    }
+
+    // 彻底删除
+    @DeleteMapping("/{id}/purge")
+    public String purge(@PathVariable String id) {
+        if (!documentRepository.existsById(id)) return "文档不存在";
         documentRepository.deleteById(id);
         redisTemplate.delete("chunks:" + id);
-        return "删除成功";
+        redisTemplate.delete("doc:status:" + id);
+        return "已彻底删除";
+    }
+
+    // 回收站列表
+    @GetMapping("/trash")
+    public List<Document> trash() {
+        return documentRepository.findByDeletedTrue();
+    }
+
+    // 恢复文档
+    @PutMapping("/{id}/restore")
+    public String restore(@PathVariable String id) {
+        Document doc = documentRepository.findById(id).orElse(null);
+        if (doc == null) return "文档不存在";
+        doc.setActive(true);
+        doc.setDeleted(false);
+        documentRepository.save(doc);
+        return "已恢复";
     }
 
     // 切换激活状态
     @PutMapping("/{id}/toggle")
     public String toggle(@PathVariable String id) {
         Document doc = documentRepository.findById(id).orElse(null);
-        if (doc == null) {
-            return "文档不存在";
-        }
+        if (doc == null) return "文档不存在";
         doc.setActive(!doc.getActive());
         documentRepository.save(doc);
         return doc.getActive() ? "已激活" : "已取消激活";

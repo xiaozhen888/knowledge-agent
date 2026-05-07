@@ -6,7 +6,8 @@ CREATE TABLE IF NOT EXISTS document (
                                         status VARCHAR(20) NOT NULL DEFAULT 'PROCESSING',
                                         chunk_count INT NULL,
                                         char_count INT NULL,
-                                        active TINYINT(1) DEFAULT 1 COMMENT '是否激活参与问答，1=是，0=否',
+                                        active TINYINT(1) DEFAULT 1 COMMENT '是否激活参与问答',
+                                        deleted TINYINT(1) DEFAULT 0 COMMENT '是否已软删除',
                                         file_md5 VARCHAR(32) DEFAULT NULL COMMENT '文件MD5值，用于去重',
                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

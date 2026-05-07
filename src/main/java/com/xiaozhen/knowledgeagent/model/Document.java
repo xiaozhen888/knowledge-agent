@@ -23,6 +23,8 @@ public class Document {
 
     private Boolean active = true;
 
+    private Boolean deleted = false;
+
     @Column(name = "file_md5")
     private String fileMd5;
 
@@ -36,6 +38,7 @@ public class Document {
         this.fileName = fileName;
         this.status = status;
         this.active = true;
+        this.deleted = false;
         this.createdAt = LocalDateTime.now();
     }
 
@@ -51,6 +54,8 @@ public class Document {
     public void setCharCount(Integer charCount) { this.charCount = charCount; }
     public Boolean getActive() { return active; }
     public void setActive(Boolean active) { this.active = active; }
+    public Boolean getDeleted() { return deleted; }
+    public void setDeleted(Boolean deleted) { this.deleted = deleted; }
     public String getFileMd5() { return fileMd5; }
     public void setFileMd5(String fileMd5) { this.fileMd5 = fileMd5; }
     public LocalDateTime getCreatedAt() { return createdAt; }
