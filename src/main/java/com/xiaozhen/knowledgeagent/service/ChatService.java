@@ -2,6 +2,8 @@ package com.xiaozhen.knowledgeagent.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xiaozhen.knowledgeagent.model.Document;
+import com.xiaozhen.knowledgeagent.repository.DocumentRepository;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import jakarta.annotation.PostConstruct;
@@ -22,8 +24,7 @@ public class ChatService {
     private final VectorService vectorService;
     private final RedisTemplate<String, String> redisTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
-
-    private List<String> allChunks = new ArrayList<>();
+    private final DocumentRepository documentRepository;
 
     @Value("${langchain4j.openai.api-key}")
     private String apiKey;
@@ -46,17 +47,28 @@ public class ChatService {
                 .build();
     }
 
-    public void storeChunks(List<String> chunks) {
-        this.allChunks = chunks;
-    }
-
     // 修改后的ask方法，支持会话历史
     public String ask(String sessionId, String question) {
+        // 1. 从数据库读取激活的文档ID
+        List<Document> activeDocs = documentRepository.findByActiveTrue();
+        List<String> allChunks = new ArrayList<>();
+        for (Document doc : activeDocs) {
+            String json = redisTemplate.opsForValue().get("chunks:" + doc.getId());
+            if (json != null) {
+                try {
+                    List<String> chunks = objectMapper.readValue(json, new TypeReference<List<String>>() {});
+                    allChunks.addAll(chunks);
+                } catch (Exception e) {
+                    // 跳过
+                }
+            }
+        }
+
         if (allChunks.isEmpty()) {
             return "请先上传文档再提问";
         }
 
-        // 1. 检索
+        // 2. 检索
         List<String> relevantChunks = vectorService.searchRelevant(allChunks, question, 3);
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < relevantChunks.size(); i++) {
@@ -64,7 +76,7 @@ public class ChatService {
             context.append(relevantChunks.get(i)).append("\n\n");
         }
 
-        // 2. 从Redis读取历史（存储为JSON字符串）
+        // 3. 从Redis读取历史（存储为JSON字符串）
         String historyKey = "chat:history:" + sessionId;
         String historyJson = redisTemplate.opsForValue().get(historyKey);
         List<Map<String, String>> history = new ArrayList<>();
@@ -76,7 +88,7 @@ public class ChatService {
             }
         }
 
-        // 3. 构建带历史的Prompt
+        // 4. 构建带历史的Prompt
         StringBuilder historyPrompt = new StringBuilder();
         if (!history.isEmpty()) {
             historyPrompt.append("【历史对话】\n");
@@ -91,17 +103,8 @@ public class ChatService {
         String dislikeKey = "feedback:dislike:" + sessionId;
         String dislikeFeedback = redisTemplate.opsForValue().get(dislikeKey);
         if (dislikeFeedback != null) {
-            // 1. 提示AI要改进回答
+            // 提示AI要改进回答
             historyPrompt.append("【系统提示】\n").append(dislikeFeedback).append("\n\n");
-
-            // 2. 重新检索更多片段（例如取 Top-6），避免无话可说
-            relevantChunks = vectorService.searchRelevant(allChunks, question, 6);
-            context = new StringBuilder();
-            for (int i = 0; i < relevantChunks.size(); i++) {
-                context.append("【参考片段").append(i + 1).append("】\n");
-                context.append(relevantChunks.get(i)).append("\n\n");
-            }
-
             redisTemplate.delete(dislikeKey);
         }
 
@@ -134,9 +137,7 @@ public class ChatService {
         Set<String> questionWords = tokenizeForHighlight(question);
         for (int i = 0; i < relevantChunks.size(); i++) {
             sourceInfo.append("\n**片段").append(i + 1).append("：** ");
-            // 关键词高亮：把chunk中的关键词用【】包起来
             String highlighted = highlightKeywords(relevantChunks.get(i), questionWords);
-            // 截取前120字做预览
             if (highlighted.length() > 120) {
                 highlighted = highlighted.substring(0, 120) + "...";
             }
@@ -145,7 +146,7 @@ public class ChatService {
 
         String finalAnswer = answer + sourceInfo.toString();
 
-        // 4. 保存本轮对话
+        // 5. 保存本轮对话
         Map<String, String> turn = new HashMap<>();
         turn.put("user", question);
         turn.put("assistant", answer);
@@ -187,7 +188,6 @@ public class ChatService {
     private String highlightKeywords(String text, Set<String> keywords) {
         String result = text;
         for (String keyword : keywords) {
-            // 忽略大小写替换
             result = result.replaceAll("(?i)" + Pattern.quote(keyword), "【" + keyword + "】");
         }
         return result;

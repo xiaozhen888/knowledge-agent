@@ -20,6 +20,10 @@
         #uploadBtn:hover { background: #4338ca; }
         #uploadStatus { margin-top: 10px; font-size: 14px; color: #666; }
 
+        .doc-list { background: white; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+        .doc-list h4 { margin-bottom: 10px; color: #333; }
+        #docList { font-size: 13px; color: #666; }
+
         .chat-area { background: white; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); overflow: hidden; }
         .chat-header { padding: 20px; border-bottom: 1px solid #eee; }
         .chat-header h3 { color: #333; }
@@ -131,6 +135,11 @@
         <div id="uploadStatus"></div>
     </div>
 
+    <div class="doc-list">
+        <h4>📋 已上传文档</h4>
+        <div id="docList">加载中...</div>
+    </div>
+
     <div class="chat-area">
         <div class="chat-header">
             <h3>💬 知识库对话</h3>
@@ -154,6 +163,43 @@
     const sessionId = 'session-' + Math.random().toString(36).substring(2, 10);
     document.getElementById('sessionId').textContent = '会话ID: ' + sessionId;
 
+    // 加载文档列表
+    async function loadDocList() {
+        try {
+            const res = await fetch('/api/document/list');
+            const docs = await res.json();
+            const listDiv = document.getElementById('docList');
+            if (!docs || docs.length === 0) {
+                listDiv.innerHTML = '暂无文档';
+                return;
+            }
+            listDiv.innerHTML = docs.map(d =>
+                `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid #eee;">
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" ${d.active ? 'checked' : ''} onchange="toggleDoc('${d.id}', this.checked)" />
+                        <span>📄 ${d.fileName} (${d.chunkCount || 0}个片段)</span>
+                        <span style="font-size:11px;color:#999;">${d.status}</span>
+                    </label>
+                    <button onclick="deleteDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#e53e3e;">删除</button>
+                </div>`
+            ).join('');
+        } catch (e) {
+            document.getElementById('docList').textContent = '加载失败';
+        }
+    }
+
+    async function toggleDoc(id, checked) {
+        await fetch('/api/document/' + id + '/toggle', { method: 'PUT' });
+    }
+
+    async function deleteDoc(id) {
+        await fetch('/api/document/' + id, { method: 'DELETE' });
+        loadDocList();
+    }
+
+    // 页面加载时调用
+    loadDocList();
+
     // 上传文档
     async function uploadDocument() {
         const fileInput = document.getElementById('fileInput');
@@ -173,6 +219,7 @@
             const res = await fetch('/api/document/upload', { method: 'POST', body: formData });
             const text = await res.text();
             statusDiv.innerHTML = '✅ ' + text;
+            loadDocList();
         } catch (e) {
             statusDiv.textContent = '❌ 上传失败: ' + e.message;
         }

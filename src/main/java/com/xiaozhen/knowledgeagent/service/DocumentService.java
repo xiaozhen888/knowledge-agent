@@ -10,6 +10,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.List;
 import java.util.UUID;
 
 @Service
@@ -20,17 +23,48 @@ public class DocumentService {
     private final DocumentRepository documentRepository;
 
     public String processDocument(MultipartFile file) throws IOException {
-        String docId = UUID.randomUUID().toString().substring(0, 8);
+        String fileName = file.getOriginalFilename();
         byte[] fileBytes = file.getBytes();
 
-        // 1. 先写MySQL，状态PROCESSING
-        Document doc = new Document(docId, file.getOriginalFilename(), "PROCESSING");
+        // 计算文件MD5
+        String md5 = calculateMD5(fileBytes);
+
+        // 查重：同名且MD5相同的文件
+        List<Document> existDocs = documentRepository.findByFileName(fileName);
+        for (Document doc : existDocs) {
+            if (md5.equals(doc.getFileMd5())) {
+                // 文件已存在，直接激活并返回
+                doc.setActive(true);
+                documentRepository.save(doc);
+                return "该文档已存在（ID: " + doc.getId() + "），已重新激活，无需重复解析";
+            }
+        }
+
+        // 不存在或内容不同，正常处理
+        String docId = UUID.randomUUID().toString().substring(0, 8);
+
+        Document doc = new Document(docId, fileName, "PROCESSING");
+        doc.setFileMd5(md5);
+        doc.setActive(true);
         documentRepository.save(doc);
 
-        // 2. 发消息
-        DocumentMessage message = new DocumentMessage(docId, fileBytes, file.getOriginalFilename());
+        DocumentMessage message = new DocumentMessage(docId, fileBytes, fileName);
         rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE_DOCUMENT, RabbitMQConfig.ROUTING_KEY, message);
 
         return "文档已提交处理，文档ID: " + docId + "，请稍后提问";
+    }
+
+    private String calculateMD5(byte[] bytes) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(bytes);
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            return UUID.randomUUID().toString().substring(0, 16);
+        }
     }
 }

@@ -1,5 +1,6 @@
 package com.xiaozhen.knowledgeagent.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xiaozhen.knowledgeagent.config.RabbitMQConfig;
 import com.xiaozhen.knowledgeagent.model.Document;
 import com.xiaozhen.knowledgeagent.model.DocumentMessage;
@@ -16,14 +17,15 @@ import java.io.ByteArrayInputStream;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 @Component
 @RequiredArgsConstructor
 public class DocumentConsumer {
 
-    private final ChatService chatService;
     private final RedisTemplate<String, String> redisTemplate;
     private final DocumentRepository documentRepository;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @RabbitListener(queues = RabbitMQConfig.QUEUE_DOCUMENT)
     public void handleDocument(DocumentMessage message) {
@@ -34,7 +36,8 @@ public class DocumentConsumer {
             String text = extractText(message.getContent(), message.getFileName());
 
             List<String> chunks = splitText(text, 500, 100);
-            chatService.storeChunks(chunks);
+            String chunksKey = "chunks:" + docId;
+            redisTemplate.opsForValue().set(chunksKey, objectMapper.writeValueAsString(chunks), 24, TimeUnit.HOURS);
 
             Document doc = documentRepository.findById(docId).orElse(null);
             if (doc != null) {

@@ -1,12 +1,13 @@
 CREATE DATABASE IF NOT EXISTS knowledge_agent DEFAULT CHARACTER SET utf8mb4;
 USE knowledge_agent;
-
 CREATE TABLE IF NOT EXISTS document (
                                         id VARCHAR(8) PRIMARY KEY,
                                         file_name VARCHAR(255) NOT NULL,
                                         status VARCHAR(20) NOT NULL DEFAULT 'PROCESSING',
                                         chunk_count INT NULL,
                                         char_count INT NULL,
+                                        active TINYINT(1) DEFAULT 1 COMMENT '是否激活参与问答，1=是，0=否',
+                                        file_md5 VARCHAR(32) DEFAULT NULL COMMENT '文件MD5值，用于去重',
                                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
