@@ -46,3 +46,4 @@ services:
 
 volumes:
   mysql_data:
+  knowledge_files:

@@ -179,16 +179,46 @@
             }
             listDiv.innerHTML = activeDocs.map(d =>
                 `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid #eee;">
-                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-                    <input type="checkbox" ${d.active ? 'checked' : ''} onchange="toggleDoc('${d.id}', this.checked)" />
-                    <span>📄 ${d.fileName} (${d.chunkCount || 0}个片段)</span>
-                    <span style="font-size:11px;color:#999;">${d.status}</span>
-                </label>
-                <button onclick="deleteDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#e53e3e;">删除</button>
-            </div>`
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" ${d.active ? 'checked' : ''} onchange="toggleDoc('${d.id}', this.checked)" />
+            <span>📄 ${d.fileName} (${d.chunkCount || 0}个片段)</span>
+            <span style="font-size:11px;color:#999;">${d.status}</span>
+        </label>
+        <div style="display:flex;gap:8px;align-items:center;">
+            ${d.needReparse ? `<button onclick="reparseDoc('${d.id}', '${d.fileName}')" style="background:none;border:none;cursor:pointer;color:#4f46e5;font-size:12px;">🔄 重新解析</button>` : ''}
+            <button onclick="deleteDoc('${d.id}')" style="background:none;border:none;cursor:pointer;color:#e53e3e;">删除</button>
+        </div>
+    </div>`
             ).join('');
         } catch (e) {
             document.getElementById('docList').textContent = '加载失败';
+        }
+    }
+
+    async function reparseDoc(id) {
+        try {
+            const res = await fetch('/api/document/' + id + '/reparse', { method: 'POST' });
+            const text = await res.text();
+            alert(text);
+            // 提取新文档ID（后端返回格式：重新解析已提交，新文档ID: xxxxxxxx）
+            const match = text.match(/新文档ID:\s*(\w+)/);
+            if (match) {
+                const newId = match[1];
+                // 轮询直到处理完成
+                let retries = 0;
+                while (retries < 15) { // 最多等15秒
+                    await new Promise(r => setTimeout(r, 1000));
+                    const statusRes = await fetch('/api/document/status/' + newId);
+                    const status = await statusRes.text();
+                    if (status === 'SUCCESS' || status.includes('FAILED')) {
+                        break;
+                    }
+                    retries++;
+                }
+            }
+            loadDocList();
+        } catch (e) {
+            alert('重新解析失败: ' + e.message);
         }
     }
 
@@ -223,6 +253,25 @@
             const res = await fetch('/api/document/upload', { method: 'POST', body: formData });
             const text = await res.text();
             statusDiv.innerHTML = '✅ ' + text;
+            // 提取文档ID
+            const match = text.match(/文档ID:\s*(\w+)/);
+            if (match) {
+                const docId = match[1];
+                let retries = 0;
+                while (retries < 15) {
+                    await new Promise(r => setTimeout(r, 1000));
+                    try {
+                        const statusRes = await fetch('/api/document/status/' + docId);
+                        const status = await statusRes.text();
+                        if (status === 'SUCCESS' || status.includes('FAILED')) {
+                            break;
+                        }
+                    } catch (e) {
+                        // 忽略网络错误，继续轮询
+                    }
+                    retries++;
+                }
+            }
             loadDocList();
         } catch (e) {
             statusDiv.textContent = '❌ 上传失败: ' + e.message;
