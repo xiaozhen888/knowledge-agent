@@ -6,6 +6,7 @@ import com.xiaozhen.knowledgeagent.model.DocumentMessage;
 import com.xiaozhen.knowledgeagent.repository.DocumentRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -21,6 +22,7 @@ public class DocumentService {
 
     private final RabbitTemplate rabbitTemplate;
     private final DocumentRepository documentRepository;
+    private final RedisTemplate<String, String> redisTemplate;
 
     public String processDocument(MultipartFile file) throws IOException {
         String fileName = file.getOriginalFilename();
@@ -33,11 +35,22 @@ public class DocumentService {
         List<Document> existDocs = documentRepository.findByFileName(fileName);
         for (Document doc : existDocs) {
             if (md5.equals(doc.getFileMd5())) {
-                // 文件已存在，直接激活并返回
-                doc.setActive(true);
-                doc.setDeleted(false);  // 从回收站恢复
-                documentRepository.save(doc);
-                return "该文档已存在（ID: " + doc.getId() + "），已重新激活，无需重复解析";
+                // 检查Redis中切片是否还存在
+                String chunksJson = redisTemplate.opsForValue().get("chunks:" + doc.getId());
+                if (chunksJson != null && !chunksJson.isEmpty()) {
+                    // 切片还在，直接激活
+                    doc.setActive(true);
+                    doc.setDeleted(false);
+                    documentRepository.save(doc);
+                    return "该文档已在回收站中，已自动恢复并激活（ID: " + doc.getId() + "）";
+                } else {
+                    // 切片过期了，删旧记录，走正常解析流程
+                    documentRepository.delete(doc);
+                    redisTemplate.delete("chunks:" + doc.getId());
+                    redisTemplate.delete("embeddings:" + doc.getId());
+                    redisTemplate.delete("doc:status:" + doc.getId());
+                    break;
+                }
             }
         }
 
