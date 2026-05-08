@@ -29,6 +29,7 @@ public class DocumentConsumer {
     private final RedisTemplate<String, String> redisTemplate;
     private final DocumentRepository documentRepository;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final EmbeddingService embeddingService;
 
     @Transactional
     @RabbitListener(queues = RabbitMQConfig.QUEUE_DOCUMENT)
@@ -41,6 +42,21 @@ public class DocumentConsumer {
             // 解析文档
             String text = extractText(message.getContent(), message.getFileName());
             List<String> chunks = splitText(text, 500, 100);
+
+            // 解析成功后，保存原始文件到本地
+            saveOriginalFile(docId, message.getContent(), message.getFileName());
+
+            // 计算每个切片的向量，存 Redis
+            List<float[]> embeddings = new ArrayList<>();
+            for (String chunk : chunks) {
+                float[] vec = embeddingService.embed(chunk);
+                embeddings.add(vec);
+            }
+            redisTemplate.opsForValue().set(
+                    "embeddings:" + docId,
+                    objectMapper.writeValueAsString(embeddings),
+                    24, TimeUnit.HOURS
+            );
 
             // 切片存Redis
             redisTemplate.opsForValue().set("chunks:" + docId, objectMapper.writeValueAsString(chunks), 24, TimeUnit.HOURS);
@@ -120,5 +136,15 @@ public class DocumentConsumer {
             start += (chunkSize - overlap);
         }
         return chunks;
+    }
+
+    private void saveOriginalFile(String docId, byte[] content, String fileName) {
+        try {
+            java.io.File dir = new java.io.File("/data/files");
+            if (!dir.exists()) dir.mkdirs();
+            java.nio.file.Files.write(new java.io.File(dir, docId + "_" + fileName).toPath(), content);
+        } catch (Exception e) {
+            System.err.println("保存原始文件失败: " + e.getMessage());
+        }
     }
 }

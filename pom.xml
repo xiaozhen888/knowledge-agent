@@ -30,6 +30,12 @@
         <java.version>17</java.version>
     </properties>
     <dependencies>
+        <!-- 本地Embedding模型支持 -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-embeddings-bge-small-zh</artifactId>
+            <version>0.34.0</version>
+        </dependency>
         <!-- Word文档解析 -->
         <dependency>
             <groupId>org.apache.poi</groupId>
