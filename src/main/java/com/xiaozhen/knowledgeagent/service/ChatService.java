@@ -3,6 +3,7 @@ package com.xiaozhen.knowledgeagent.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xiaozhen.knowledgeagent.model.ChunkResult;
 import com.xiaozhen.knowledgeagent.model.Document;
 import com.xiaozhen.knowledgeagent.model.ChatHistory;
 import com.xiaozhen.knowledgeagent.repository.DocumentRepository;
@@ -30,6 +31,7 @@ public class ChatService {
     private final ChatHistoryRepository chatHistoryRepository;
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final RerankService rerankService;
 
     @Value("${langchain4j.openai.api-key}")
     private String apiKey;
@@ -55,20 +57,18 @@ public class ChatService {
     public String ask(String sessionId, String question) throws JsonProcessingException {
         // ========== 1. 从数据库读取激活且未删除的文档切片 ==========
         List<Document> activeDocs = documentRepository.findByActiveTrueAndDeletedFalse();
-        List<String> allChunks = new ArrayList<>();
+        List<ChunkResult> allChunkResults = new ArrayList<>();
         for (Document doc : activeDocs) {
             String json = redisTemplate.opsForValue().get("chunks:" + doc.getId());
             if (json != null) {
-                try {
-                    List<String> chunks = objectMapper.readValue(json, new TypeReference<List<String>>() {});
-                    allChunks.addAll(chunks);
-                } catch (Exception e) {
-                    // 跳过
+                List<String> chunks = objectMapper.readValue(json, new TypeReference<List<String>>() {});
+                for (int i = 0; i < chunks.size(); i++) {
+                    allChunkResults.add(new ChunkResult(chunks.get(i), doc.getId(), doc.getFileName(), i));
                 }
             }
         }
 
-        if (allChunks.isEmpty()) {
+        if (allChunkResults.isEmpty()) {
             return "请先上传文档再提问";
         }
 
@@ -85,34 +85,67 @@ public class ChatService {
             redisTemplate.opsForValue().set(questionEmbeddingKey, objectMapper.writeValueAsString(queryVector), 10, TimeUnit.MINUTES);
         }
 
-        // 关键词路：Top-10
-        List<String> keywordResults = vectorService.searchRelevant(allChunks, question, 10);
+        // 关键词路：Top-15
+        List<String> allContents = allChunkResults.stream()
+                .map(ChunkResult::getContent)
+                .collect(java.util.stream.Collectors.toList());
+
+        List<String> keywordContents = vectorService.searchRelevant(allContents, question, 15);
+        Set<String> keywordSet = new HashSet<>(keywordContents);
+        List<ChunkResult> keywordResults = allChunkResults.stream()
+                .filter(c -> keywordSet.contains(c.getContent()))
+                .collect(java.util.stream.Collectors.toList());
 
         // 向量路：读取所有激活文档的向量，做语义检索
-        List<String> embeddingResults = new ArrayList<>();
+        List<String> embeddingContents = new ArrayList<>();
         for (Document doc : activeDocs) {
             String embJson = redisTemplate.opsForValue().get("embeddings:" + doc.getId());
             String chunksJson = redisTemplate.opsForValue().get("chunks:" + doc.getId());
+
             if (embJson != null && chunksJson != null) {
                 try {
                     List<float[]> docEmbeddings = objectMapper.readValue(embJson, new TypeReference<List<float[]>>() {});
                     List<String> docChunks = objectMapper.readValue(chunksJson, new TypeReference<List<String>>() {});
-                    List<String> topFromDoc = vectorService.searchByEmbedding(docChunks, docEmbeddings, queryVector, 10);
-                    embeddingResults.addAll(topFromDoc);
+                    List<String> topFromDoc = vectorService.searchByEmbedding(docChunks, docEmbeddings, queryVector, 15);
+                    embeddingContents.addAll(topFromDoc);
                 } catch (Exception e) {
                     // 跳过解析失败的
                 }
             }
         }
 
-        // 融合：合并去重，加权排序
-        List<String> relevantChunks = mergeAndRank(keywordResults, embeddingResults, question, queryVector, 3);
+        Set<String> embeddingSet = new HashSet<>(embeddingContents);
+        List<ChunkResult> embeddingResults = allChunkResults.stream()
+                .filter(c -> embeddingSet.contains(c.getContent()))
+                .collect(java.util.stream.Collectors.toList());
 
-        // 构造上下文
+
+        // 去重（按 content 去重，保留第一个出现的）
+        Set<String> seen = new HashSet<>();
+        List<ChunkResult> allCandidates = new ArrayList<>();
+        for (ChunkResult c : keywordResults) {
+            if (seen.add(c.getContent())) allCandidates.add(c);
+        }
+        for (ChunkResult c : embeddingResults) {
+            if (seen.add(c.getContent())) allCandidates.add(c);
+        }
+
+        List<ChunkResult> relevantChunks = rerankService.rerank(allCandidates, question, 3);
+
+/*        // 构造上下文
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < relevantChunks.size(); i++) {
             context.append("【参考片段").append(i + 1).append("】\n");
             context.append(relevantChunks.get(i)).append("\n\n");
+        }*/
+
+        StringBuilder context = new StringBuilder();
+        for (int i = 0; i < relevantChunks.size(); i++) {
+            ChunkResult chunk = relevantChunks.get(i);
+            context.append("{片段").append(i + 1).append("}\n");
+            context.append(chunk.getContent()).append("\n");
+            context.append("[来源: 《").append(chunk.getDocName())
+                    .append("》 第").append(chunk.getChunkIndex()).append("段]\n\n");
         }
 
         // ========== 3. 读历史：优先Redis，未命中查MySQL并回填 ==========
@@ -163,24 +196,28 @@ public class ChatService {
         }
 
         String prompt = """
-                        你是一个专业、清晰的知识库助手。
-                        
-                        回答规则：
-                        1. 默认使用分点形式回答，用"1."、"2."、"3."编号，简洁明了。
-                        2. 如果用户明确要求"用一句话回答"或"用一段话总结"，则用完整的一段话来回复。
-                        3. 回答只基于参考内容，不要编造信息。
-                        4. 如果参考内容不足以回答问题，请如实告知。
-                        5. 【重要】不要使用任何Markdown格式：不要用**加粗**、不要用*斜体*、不要用-或*列表符号、不要用#标题。直接输出纯文本。
-                        
-                        %s
-                        【参考内容】
-                        %s
-                        
-                        【用户当前问题】
-                        %s
-                        
-                        【你的回答】
-                        """
+    你是一位严谨的文档问答助手。请严格遵循以下规则：
+
+    【规则】
+    1. 必须仅基于下方提供的【参考文档片段】回答问题，禁止引用片段外的任何知识
+    2. 如果参考片段无法回答问题，必须明确回答："根据提供的文档，无法找到相关信息"
+    3. 回答时必须标注信息来源，格式为：[来源: 《文档名称》 第{index}段]
+    4. 禁止编造、推测、扩展文档中不存在的内容
+    5. 如果多个片段冲突，优先采用最新或最具体的片段
+
+    %s
+    【参考文档片段】
+    %s
+
+    【用户问题】
+    %s
+
+    【回答要求】
+    - 先给出简洁答案（1-2句话）
+    - 如需详细说明，使用分点形式
+    - 每个事实后标注来源
+    - 禁止输出Markdown格式
+    """
                 .formatted(historyPrompt.toString(), context.toString(), question);
 
         String answer = model.generate(prompt);
@@ -188,14 +225,35 @@ public class ChatService {
         // ========== 5. 拼接溯源信息 ==========
         StringBuilder sourceInfo = new StringBuilder();
         sourceInfo.append("\n\n---\n📚 **参考来源**\n");
-        Set<String> questionWords = tokenizeForHighlight(question);
+
         for (int i = 0; i < relevantChunks.size(); i++) {
-            sourceInfo.append("\n**片段").append(i + 1).append("：** ");
-            String highlighted = highlightKeywords(relevantChunks.get(i), questionWords);
-            if (highlighted.length() > 120) {
-                highlighted = highlighted.substring(0, 120) + "...";
+            ChunkResult chunk = relevantChunks.get(i);
+
+            // 从Redis取该文档的所有片段
+            String chunksJson = redisTemplate.opsForValue().get("chunks:" + chunk.getDocId());
+            List<String> allChunks = objectMapper.readValue(chunksJson, new TypeReference<List<String>>() {});
+            int idx = chunk.getChunkIndex();
+
+            StringBuilder display = new StringBuilder();
+
+            // 前一句（取前一段的最后30字）
+            if (idx > 0) {
+                String prev = allChunks.get(idx - 1);
+                display.append("...").append(prev.substring(Math.max(0, prev.length() - 30)));
             }
-            sourceInfo.append(highlighted);
+
+            // 当前片段
+            display.append(chunk.getContent());
+
+            // 后一句（取下一段的前30字）
+            if (idx < allChunks.size() - 1) {
+                String next = allChunks.get(idx + 1);
+                display.append(next.substring(0, Math.min(30, next.length()))).append("...");
+            }
+
+            sourceInfo.append("\n**片段").append(i + 1).append("**（《")
+                    .append(chunk.getDocName()).append("》第").append(idx).append("段）：")
+                    .append(display);
         }
 
         String finalAnswer = answer + sourceInfo.toString();
@@ -226,54 +284,6 @@ public class ChatService {
         } catch (JsonProcessingException e) {
             return "系统内部错误: " + e.getMessage();
         }
-    }
-
-    // ========== 双路融合排序 ==========
-    private List<String> mergeAndRank(List<String> keywordResults, List<String> embeddingResults,
-                                      String question, float[] queryVector, int topK) {
-        // 合并去重
-        Map<String, Double> scores = new LinkedHashMap<>();
-        for (String chunk : keywordResults) {
-            scores.putIfAbsent(chunk, 0.0);
-        }
-        for (String chunk : embeddingResults) {
-            scores.putIfAbsent(chunk, 0.0);
-        }
-
-        if (scores.isEmpty()) {
-            return new ArrayList<>();
-        }
-
-        List<String> allKeys = new ArrayList<>(scores.keySet());
-
-        // 关键词路：给每个chunk重算Jaccard分数
-        List<String> kwAll = vectorService.searchRelevant(allKeys, question, allKeys.size());
-        for (int i = 0; i < kwAll.size(); i++) {
-            String chunk = kwAll.get(i);
-            double kwScore = (double) (allKeys.size() - i) / allKeys.size();
-            scores.put(chunk, scores.get(chunk) + kwScore * 0.3);
-        }
-
-        // 向量路：算余弦相似度加权
-        for (String chunk : allKeys) {
-            try {
-                float[] chunkVec = embeddingService.embed(chunk);
-                double sim = embeddingService.cosineSimilarity(queryVector, chunkVec);
-                scores.put(chunk, scores.get(chunk) + sim * 0.7);
-            } catch (Exception e) {
-                // 单个chunk向量化失败，跳过
-            }
-        }
-
-        // 按最终分数排序
-        List<Map.Entry<String, Double>> sorted = new ArrayList<>(scores.entrySet());
-        sorted.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
-
-        List<String> result = new ArrayList<>();
-        for (int i = 0; i < Math.min(topK, sorted.size()); i++) {
-            result.add(sorted.get(i).getKey());
-        }
-        return result;
     }
 
     // ========== 高亮相关方法 ==========
