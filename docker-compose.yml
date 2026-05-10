@@ -31,6 +31,8 @@ services:
     container_name: knowledge-agent
     ports:
       - "8080:8080"
+    volumes:
+        - knowledge_files:/data/files
     environment:
       - SPRING_DATA_REDIS_HOST=redis
       - SPRING_RABBITMQ_HOST=rabbitmq
