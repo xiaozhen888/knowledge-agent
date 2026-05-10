@@ -127,15 +127,61 @@ public class DocumentConsumer {
         redisTemplate.opsForValue().set("doc:status:" + docId, status, Duration.ofHours(1));
     }
 
-    private List<String> splitText(String text, int chunkSize, int overlap) {
+    // 修改后的 splitText 和 splitLongParagraph
+    private List<String> splitText(String text, int maxLen, int overlap) {
         List<String> chunks = new ArrayList<>();
-        int start = 0;
-        while (start < text.length()) {
-            int end = Math.min(start + chunkSize, text.length());
-            chunks.add(text.substring(start, end));
-            start += (chunkSize - overlap);
+        String[] paragraphs = text.split("\\n\\s*\\n");
+
+        for (String paragraph : paragraphs) {
+            paragraph = paragraph.trim();
+            if (paragraph.isEmpty()) continue;
+
+            if (paragraph.length() <= maxLen) {
+                chunks.add(paragraph);
+            } else {
+                chunks.addAll(splitLongParagraph(paragraph, maxLen, overlap));
+            }
         }
         return chunks;
+    }
+
+    private List<String> splitLongParagraph(String text, int maxLen, int overlap) {
+        List<String> result = new ArrayList<>();
+        int start = 0;
+
+        while (start < text.length()) {
+            int end = Math.min(start + maxLen, text.length());
+
+            // 如果不是最后一段，尝试在句末标点处切分
+            if (end < text.length()) {
+                int searchStart = Math.max(start + maxLen / 2, end - 50);
+                int cutPos = -1;
+                for (int i = end - 1; i >= searchStart; i--) {
+                    char c = text.charAt(i);
+                    if (c == '。' || c == '！' || c == '？' || c == '；' || c == '.') {
+                        cutPos = i + 1;
+                        break;
+                    }
+                }
+                if (cutPos != -1) {
+                    end = cutPos;
+                }
+            }
+
+            String chunk = text.substring(start, end).trim();
+            if (!chunk.isEmpty()) {
+                result.add(chunk);
+            }
+
+            // 关键：下一段起点回退 overlap，保证上下文连贯
+            start = end - overlap;
+            if (start >= end) start = end; // 防止 overlap >= maxLen 导致死循环
+        }
+        return result;
+    }
+
+    private boolean isPunctuation(char c) {
+        return c == '。' || c == '！' || c == '？' || c == '；' || c == '，' || c == '、' || c == '\n' || c == ' ';
     }
 
     private void saveOriginalFile(String docId, byte[] content, String fileName) {
