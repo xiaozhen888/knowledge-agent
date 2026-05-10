@@ -11,4 +11,5 @@ public interface DocumentRepository extends JpaRepository<Document, String> {
     List<Document> findByFileName(String fileName);
     List<Document> findByActiveTrueAndDeletedFalse();
     List<Document> findByDeletedTrue();
+    boolean existsByFileName(String fileName);
 }
