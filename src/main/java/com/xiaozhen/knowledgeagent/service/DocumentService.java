@@ -25,14 +25,14 @@ public class DocumentService {
     private final RedisTemplate<String, String> redisTemplate;
 
     public String processDocument(MultipartFile file) throws IOException {
-        String fileName = file.getOriginalFilename();
+        String originalFileName = file.getOriginalFilename();
         byte[] fileBytes = file.getBytes();
 
         // 计算文件MD5
         String md5 = calculateMD5(fileBytes);
 
-        // 查重：同名且MD5相同的文件
-        List<Document> existDocs = documentRepository.findByFileName(fileName);
+        // 1. MD5去重：检查是否已有相同内容的文件
+        List<Document> existDocs = documentRepository.findByFileName(originalFileName);
         for (Document doc : existDocs) {
             if (md5.equals(doc.getFileMd5())) {
                 // 检查Redis中切片是否还存在
@@ -54,18 +54,41 @@ public class DocumentService {
             }
         }
 
-        // 不存在或内容不同，正常处理
+        // 2. 文件名去重：不同内容但同名时，自动加后缀
+        String uniqueFileName = generateUniqueFileName(originalFileName);
+
+        // 3. 正常处理
         String docId = UUID.randomUUID().toString().substring(0, 8);
 
-        Document doc = new Document(docId, fileName, "PROCESSING");
+        Document doc = new Document(docId, uniqueFileName, "PROCESSING");
         doc.setFileMd5(md5);
         doc.setActive(true);
         documentRepository.save(doc);
 
-        DocumentMessage message = new DocumentMessage(docId, fileBytes, fileName);
+        DocumentMessage message = new DocumentMessage(docId, fileBytes, uniqueFileName);
         rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE_DOCUMENT, RabbitMQConfig.ROUTING_KEY, message);
 
         return "文档已提交处理，文档ID: " + docId + "，请稍后提问";
+    }
+
+    /**
+     * 生成唯一文件名：同名自动加 (1)、(2) 后缀
+     */
+    private String generateUniqueFileName(String originalFileName) {
+        int dotIndex = originalFileName.lastIndexOf(".");
+        String name = dotIndex > 0 ? originalFileName.substring(0, dotIndex) : originalFileName;
+        String ext = dotIndex > 0 ? originalFileName.substring(dotIndex) : "";
+
+        String candidate = originalFileName;
+        int count = 1;
+
+        // 循环检查，直到找到数据库中不存在的文件名
+        while (documentRepository.existsByFileName(candidate)) {
+            candidate = name + "(" + count + ")" + ext;
+            count++;
+        }
+
+        return candidate;
     }
 
     private String calculateMD5(byte[] bytes) {
