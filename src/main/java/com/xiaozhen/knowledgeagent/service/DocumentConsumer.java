@@ -40,8 +40,10 @@ public class DocumentConsumer {
             updateStatus(docId, "PROCESSING");
 
             // 解析文档
-            String text = extractText(message.getContent(), message.getFileName());
-            List<String> chunks = splitText(text, 500, 100);
+            String rawText = extractText(message.getContent(), message.getFileName());
+            String text = formatPdfText(rawText);
+            String correctedText = reorderPdfText(text);
+            List<String> chunks = splitText(correctedText, 500, 0);
 
             // 解析成功后，保存原始文件到本地
             saveOriginalFile(docId, message.getContent(), message.getFileName());
@@ -108,10 +110,15 @@ public class DocumentConsumer {
     }
 
     private String extractPdfText(byte[] content) throws Exception {
-        PDDocument document = PDDocument.load(new ByteArrayInputStream(content));
+        PDDocument pdfDocument = PDDocument.load(content);
+
+        // 关键：设置按页面阅读顺序提取文本，而不是按写入顺序
         PDFTextStripper stripper = new PDFTextStripper();
-        String text = stripper.getText(document);
-        document.close();
+        stripper.setSortByPosition(true);   // 按页面坐标排序（上->下，左->右）
+        stripper.setShouldSeparateByBeads(true); // 按文本块分离
+
+        String text = stripper.getText(pdfDocument);
+        pdfDocument.close();
         return text;
     }
 
@@ -127,56 +134,85 @@ public class DocumentConsumer {
         redisTemplate.opsForValue().set("doc:status:" + docId, status, Duration.ofHours(1));
     }
 
-    // 修改后的 splitText 和 splitLongParagraph
     private List<String> splitText(String text, int maxLen, int overlap) {
         List<String> chunks = new ArrayList<>();
+
+        // 1. 先按空行分割成自然段落
         String[] paragraphs = text.split("\\n\\s*\\n");
 
-        for (String paragraph : paragraphs) {
-            paragraph = paragraph.trim();
-            if (paragraph.isEmpty()) continue;
+        StringBuilder current = new StringBuilder();
 
-            if (paragraph.length() <= maxLen) {
-                chunks.add(paragraph);
+        for (String para : paragraphs) {
+            para = para.trim().replaceAll("\\s+", " ");  // 去多余空格
+            if (para.isEmpty()) continue;
+
+            // 如果当前段落本身就很长，需要进一步切分
+            if (para.length() > maxLen) {
+                // 先把之前累积的内容保存
+                if (current.length() > 0) {
+                    chunks.add(current.toString().trim());
+                    current = new StringBuilder();
+                }
+                // 长段落按句子切分
+                chunks.addAll(splitLongParagraph(para, maxLen, overlap));
             } else {
-                chunks.addAll(splitLongParagraph(paragraph, maxLen, overlap));
+                // 短段落，尝试合并到当前片段
+                if (current.length() + para.length() + 2 > maxLen && current.length() > 0) {
+                    chunks.add(current.toString().trim());
+                    current = new StringBuilder();
+                }
+                if (current.length() > 0) {
+                    current.append("\n\n");
+                }
+                current.append(para);
             }
         }
+
+        // 最后一段
+        if (current.length() > 0) {
+            chunks.add(current.toString().trim());
+        }
+
         return chunks;
     }
 
     private List<String> splitLongParagraph(String text, int maxLen, int overlap) {
         List<String> result = new ArrayList<>();
-        int start = 0;
 
-        while (start < text.length()) {
-            int end = Math.min(start + maxLen, text.length());
+        // 先按句子拆分
+        String[] sentences = text.split("(?<=[。！？；.])\\s*");
+        StringBuilder current = new StringBuilder();
 
-            // 如果不是最后一段，尝试在句末标点处切分
-            if (end < text.length()) {
-                int searchStart = Math.max(start + maxLen / 2, end - 50);
-                int cutPos = -1;
-                for (int i = end - 1; i >= searchStart; i--) {
-                    char c = text.charAt(i);
-                    if (c == '。' || c == '！' || c == '？' || c == '；' || c == '.') {
-                        cutPos = i + 1;
-                        break;
-                    }
+        for (String sentence : sentences) {
+            sentence = sentence.trim();
+            if (sentence.isEmpty()) continue;
+
+            // 如果单句就超过maxLen，强制切分（很少见）
+            if (sentence.length() > maxLen) {
+                if (current.length() > 0) {
+                    result.add(current.toString().trim());
+                    current = new StringBuilder();
                 }
-                if (cutPos != -1) {
-                    end = cutPos;
+                // 按字数硬切
+                for (int i = 0; i < sentence.length(); i += maxLen) {
+                    int end = Math.min(i + maxLen, sentence.length());
+                    result.add(sentence.substring(i, end));
                 }
+                continue;
             }
 
-            String chunk = text.substring(start, end).trim();
-            if (!chunk.isEmpty()) {
-                result.add(chunk);
+            // 正常情况：按句子累加
+            if (current.length() + sentence.length() > maxLen && current.length() > 0) {
+                result.add(current.toString().trim());
+                current = new StringBuilder();
             }
-
-            // 关键：下一段起点回退 overlap，保证上下文连贯
-            start = end - overlap;
-            if (start >= end) start = end; // 防止 overlap >= maxLen 导致死循环
+            current.append(sentence);
         }
+
+        if (current.length() > 0) {
+            result.add(current.toString().trim());
+        }
+
         return result;
     }
 
@@ -187,10 +223,74 @@ public class DocumentConsumer {
     private void saveOriginalFile(String docId, byte[] content, String fileName) {
         try {
             java.io.File dir = new java.io.File("/data/files");
-            if (!dir.exists()) dir.mkdirs();
-            java.nio.file.Files.write(new java.io.File(dir, docId + "_" + fileName).toPath(), content);
+            if (!dir.exists()) {
+                boolean created = dir.mkdirs();
+                System.out.println("创建目录 /data/files: " + created);
+            }
+            java.io.File targetFile = new java.io.File(dir, docId + "_" + fileName);
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(targetFile)) {
+                fos.write(content);
+                fos.flush();
+            }
+            System.out.println("原始文件已保存: " + targetFile.getAbsolutePath() + "，大小: " + content.length);
         } catch (Exception e) {
             System.err.println("保存原始文件失败: " + e.getMessage());
+            e.printStackTrace();
         }
+    }
+
+    /**
+     * 修复 PDF 提取文本时因分栏布局、页眉页脚等导致的段落错乱问题
+     */
+    private String reorderPdfText(String rawText) {
+        // 先拆分成行
+        String[] lines = rawText.split("\\n");
+        List<String> fixedLines = new ArrayList<>();
+
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) continue;
+
+            // 如果这一行是一个独立的标题（短句、没有句号、可能以数字开头）
+            boolean looksLikeTitle = trimmed.length() <= 50
+                    && !trimmed.endsWith("。")
+                    && !trimmed.endsWith("，")
+                    && !trimmed.startsWith("●")
+                    && !trimmed.startsWith("-");
+
+            if (looksLikeTitle) {
+                // 强制这个标题自成一段：在前一行后补两个换行，然后追加标题行
+                fixedLines.add("\n\n" + trimmed);
+            } else {
+                // 普通正文行直接追加
+                fixedLines.add(trimmed);
+            }
+        }
+
+        // 重新拼合成完整文本，去掉开头可能的多余换行
+        return String.join("\n", fixedLines).replaceAll("\\n{3,}", "\n\n");
+    }
+
+    /**
+     * 修复 PDF 提取文本中常见的换行错误
+     */
+    private String formatPdfText(String rawText) {
+        // 1. 先按空行分割成段落，保护真正的段落边界
+        String[] paragraphs = rawText.split("\\n\\s*\\n");
+        List<String> cleanParagraphs = new ArrayList<>();
+
+        for (String para : paragraphs) {
+            String trimmedPara = para.trim();
+            if (trimmedPara.isEmpty()) continue;
+
+            // 2. 把段落内部 PDF 造成的物理换行，替换为空格（中文语境）
+            // 英文/数字结尾的行，可能是正常的换行，用空格连接
+            String cleanLine = trimmedPara.replaceAll("\\r?\\n", " ");
+            // 去掉多余的空格
+            cleanLine = cleanLine.replaceAll("\\s{2,}", " ");
+            cleanParagraphs.add(cleanLine);
+        }
+
+        return String.join("\n\n", cleanParagraphs);
     }
 }
