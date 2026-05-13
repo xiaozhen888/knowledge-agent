@@ -19,9 +19,16 @@ import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -58,15 +65,30 @@ public class ChatService {
     }
 
     public String ask(String sessionId, String question) throws JsonProcessingException {
-        // ========== 1. 从数据库读取激活且未删除的文档切片 ==========
         List<Document> activeDocs = documentRepository.findByActiveTrueAndDeletedFalse();
+
         List<ChunkResult> allChunkResults = new ArrayList<>();
+        List<float[]> allEmbeddings = new ArrayList<>();
+
         for (Document doc : activeDocs) {
-            String json = redisTemplate.opsForValue().get("chunks:" + doc.getId());
-            if (json != null) {
-                List<String> chunks = objectMapper.readValue(json, new TypeReference<List<String>>() {});
-                for (int i = 0; i < chunks.size(); i++) {
-                    allChunkResults.add(new ChunkResult(chunks.get(i), doc.getId(), doc.getFileName(), i));
+            String chunksJson = redisTemplate.opsForValue().get("chunks:" + doc.getId());
+            String embJson = redisTemplate.opsForValue().get("embeddings:" + doc.getId());
+
+            if (chunksJson != null && embJson != null) {
+                try {
+                    List<String> chunks = objectMapper.readValue(chunksJson, new TypeReference<List<String>>() {});
+                    List<float[]> embeddings = objectMapper.readValue(embJson, new TypeReference<List<float[]>>() {});
+
+                    if (chunks.size() == embeddings.size()) {
+                        for (int i = 0; i < chunks.size(); i++) {
+                            allChunkResults.add(new ChunkResult(chunks.get(i), doc.getId(), doc.getFileName(), i));
+                            allEmbeddings.add(embeddings.get(i));
+                        }
+                    } else {
+                        logger.warn("文档 {} 切片数({})和向量数({})不一致", doc.getId(), chunks.size(), embeddings.size());
+                    }
+                } catch (Exception e) {
+                    logger.warn("解析文档 {} 的Redis数据失败: {}", doc.getId(), e.getMessage());
                 }
             }
         }
@@ -75,8 +97,6 @@ public class ChatService {
             return "请先上传文档再提问";
         }
 
-        // ========== 2. 双路检索 + 融合排序 ==========
-        // 获取问题向量（优先从Redis缓存读）
         String questionEmbeddingKey = "embedding:query:" + sessionId;
         String cachedQueryJson = redisTemplate.opsForValue().get(questionEmbeddingKey);
         float[] queryVector;
@@ -88,42 +108,30 @@ public class ChatService {
             redisTemplate.opsForValue().set(questionEmbeddingKey, objectMapper.writeValueAsString(queryVector), 10, TimeUnit.MINUTES);
         }
 
-        // 关键词路：Top-15
         List<String> allContents = allChunkResults.stream()
                 .map(ChunkResult::getContent)
-                .collect(java.util.stream.Collectors.toList());
+                .collect(Collectors.toList());
 
         List<String> keywordContents = vectorService.searchRelevant(allContents, question, 15);
         Set<String> keywordSet = new HashSet<>(keywordContents);
         List<ChunkResult> keywordResults = allChunkResults.stream()
                 .filter(c -> keywordSet.contains(c.getContent()))
-                .collect(java.util.stream.Collectors.toList());
+                .collect(Collectors.toList());
 
-        // 向量路：读取所有激活文档的向量，做语义检索
-        List<String> embeddingContents = new ArrayList<>();
-        for (Document doc : activeDocs) {
-            String embJson = redisTemplate.opsForValue().get("embeddings:" + doc.getId());
-            String chunksJson = redisTemplate.opsForValue().get("chunks:" + doc.getId());
+        List<VectorService.ScoredChunk> vectorScored = vectorService.searchByEmbeddingWithScore(
+                allEmbeddings, queryVector, 30, 0.0);
 
-            if (embJson != null && chunksJson != null) {
-                try {
-                    List<float[]> docEmbeddings = objectMapper.readValue(embJson, new TypeReference<List<float[]>>() {});
-                    List<String> docChunks = objectMapper.readValue(chunksJson, new TypeReference<List<String>>() {});
-                    List<String> topFromDoc = vectorService.searchByEmbedding(docChunks, docEmbeddings, queryVector, 15);
-                    embeddingContents.addAll(topFromDoc);
-                } catch (Exception e) {
-                    // 跳过解析失败的
-                }
-            }
+        List<ChunkResult> embeddingResults = new ArrayList<>();
+        for (VectorService.ScoredChunk sc : vectorScored) {
+            ChunkResult cr = allChunkResults.get(sc.index);
+            cr.setScore(sc.score);
+            embeddingResults.add(cr);
         }
 
-        Set<String> embeddingSet = new HashSet<>(embeddingContents);
-        List<ChunkResult> embeddingResults = allChunkResults.stream()
-                .filter(c -> embeddingSet.contains(c.getContent()))
-                .collect(java.util.stream.Collectors.toList());
+        logger.info("关键词路召回: {} 个, 向量路召回: {} 个)",
+                keywordResults.size(), embeddingResults.size());
 
-
-        // 去重（按 content 去重，保留第一个出现的）
+        // ========== 4. 融合去重 ==========
         Set<String> seen = new HashSet<>();
         List<ChunkResult> allCandidates = new ArrayList<>();
         for (ChunkResult c : keywordResults) {
@@ -133,7 +141,31 @@ public class ChatService {
             if (seen.add(c.getContent())) allCandidates.add(c);
         }
 
-        List<ChunkResult> relevantChunks = rerankService.rerank(allCandidates, question, 3);
+        logger.info("融合去重后候选集: {} 个", allCandidates.size());
+
+        // ========== 新增：如果候选太多，只保留Top100 ==========
+        if (allCandidates.size() > 100) {
+            allCandidates = allCandidates.stream()
+                    .sorted((a, b) -> Double.compare(b.getScore(), a.getScore()))
+                    .limit(100)
+                    .collect(Collectors.toList());
+            logger.info("截断后候选集: {} 个", allCandidates.size());
+        }
+
+        // ========== 5. 精排（Top-30） ==========
+        List<ChunkResult> relevantChunks = rerankService.rerank(allCandidates, question, 30);
+
+        if (relevantChunks.isEmpty()) {
+            logger.warn("精排后无有效候选，问题: {}", question);
+            return "根据提供的文档，无法找到相关信息。";
+        }
+
+        logger.info("精排后Top片段:");
+        for (int i = 0; i < Math.min(3, relevantChunks.size()); i++) {
+            ChunkResult c = relevantChunks.get(i);
+            String preview = c.getContent().substring(0, Math.min(80, c.getContent().length()));
+            logger.info("  Top{}: score={}, content={}", i + 1, c.getScore(), preview);
+        }
 
         StringBuilder context = new StringBuilder();
         for (int i = 0; i < relevantChunks.size(); i++) {
@@ -144,7 +176,6 @@ public class ChatService {
                     .append("》 第").append(chunk.getChunkIndex()).append("段]\n\n");
         }
 
-        // ========== 3. 读历史：优先Redis，未命中查MySQL并回填 ==========
         String historyKey = "chat:history:" + sessionId;
         String historyJson = redisTemplate.opsForValue().get(historyKey);
         List<Map<String, String>> history = new ArrayList<>();
@@ -167,12 +198,10 @@ public class ChatService {
                 try {
                     redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
                 } catch (Exception e) {
-                    // 回填失败不影响
                 }
             }
         }
 
-        // ========== 4. 构建带历史的Prompt ==========
         StringBuilder historyPrompt = new StringBuilder();
         if (!history.isEmpty()) {
             historyPrompt.append("【历史对话】\n");
@@ -183,7 +212,6 @@ public class ChatService {
             historyPrompt.append("\n");
         }
 
-        // === 差评反馈逻辑 ===
         String dislikeKey = "feedback:dislike:" + sessionId;
         String dislikeFeedback = redisTemplate.opsForValue().get(dislikeKey);
         if (dislikeFeedback != null) {
@@ -198,8 +226,9 @@ public class ChatService {
                         1. 必须仅基于下方提供的【参考文档片段】回答问题，禁止引用片段外的任何知识
                         2. 如果参考片段无法回答问题，必须明确回答："根据提供的文档，无法找到相关信息"
                         3. 回答时必须标注信息来源，格式为：[来源: 《文档名称》 第{index}段]
-                        4. 禁止编造、推测、扩展文档中不存在的内容
-                        5. 如果多个片段冲突，优先采用最新或最具体的片段
+                        4. 每个事实后必须紧跟来源标注，禁止在回答末尾统一标注
+                        5. 禁止编造、推测、扩展文档中不存在的内容
+                        6. 如果多个片段冲突，优先采用最新或最具体的片段
                     
                         %s
                         【参考文档片段】
@@ -211,51 +240,48 @@ public class ChatService {
                         【回答要求】
                         - 先给出简洁答案（1-2句话）
                         - 如需详细说明，使用分点形式
-                        - 每个事实后标注来源
+                        - 每个事实后标注来源，格式：[来源: 《文档名称》 第N段]
                         - 禁止输出Markdown格式
+                        - 禁止在回答末尾列出所有来源
                         """
                 .formatted(historyPrompt.toString(), context.toString(), question);
 
         String answer = model.generate(prompt);
 
-        // ========== 5. 解析回答中实际引用的来源 ==========
+        // ========== 9. 尝试解析模型引用的来源（仅用于日志观察） ==========
         Set<String> citedSources = extractCitedSources(answer);
         logger.info("模型引用了 {} 个来源: {}", citedSources.size(), citedSources);
 
-        // ========== 6. 拼接溯源信息（只展示被引用的） ==========
+        // ========== 10. 拼接溯源信息：只展示模型实际引用的片段 ==========
         StringBuilder sourceInfo = new StringBuilder();
 
-        // 过滤：只保留被模型实际引用的片段
+        // 严格过滤：只保留模型实际标注了来源的片段
         List<ChunkResult> citedChunks = new ArrayList<>();
         for (ChunkResult chunk : relevantChunks) {
             String sourceKey = chunk.getDocName() + ":" + chunk.getChunkIndex();
-            // 如果模型有标注来源，且匹配当前片段，才展示
-            if (citedSources.isEmpty() || citedSources.contains(sourceKey)) {
+            if (citedSources.contains(sourceKey)) {
                 citedChunks.add(chunk);
             }
         }
 
-        // 如果模型一个都没标注，兜底展示全部（避免空来源）
+        // 如果模型一个都没标注，兜底展示Top3（避免完全没来源）
         if (citedChunks.isEmpty()) {
-            citedChunks = relevantChunks;
+            logger.warn("模型未标注任何来源，兜底展示Top3");
+            citedChunks = relevantChunks.subList(0, Math.min(3, relevantChunks.size()));
         }
 
         if (!citedChunks.isEmpty()) {
             sourceInfo.append("\n\n---\n📚 **参考来源**\n");
             for (int i = 0; i < citedChunks.size(); i++) {
                 ChunkResult chunk = citedChunks.get(i);
-                int idx = chunk.getChunkIndex();
-
-                sourceInfo.append("\n**片段").append(i + 1).append("**（《")
-                        .append(chunk.getDocName()).append("》第").append(idx).append("段）：")
-                        .append(truncate(chunk.getContent().replace("\n", "<br>"), 800));
+                sourceInfo.append("\n【《").append(chunk.getDocName())
+                        .append("》第").append(chunk.getChunkIndex()).append("段】\n")
+                        .append(chunk.getContent());
             }
         }
 
-
         String finalAnswer = answer + sourceInfo.toString();
 
-        // ========== 7. 双写对话历史：MySQL + Redis ==========
         ChatHistory ch = new ChatHistory(sessionId, question, answer);
         chatHistoryRepository.save(ch);
 
@@ -269,7 +295,6 @@ public class ChatService {
         try {
             redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
         } catch (Exception e) {
-            // Redis写失败不影响，下次读时会从MySQL回填
         }
 
         return finalAnswer;
@@ -288,7 +313,6 @@ public class ChatService {
         return text.substring(0, maxLen) + "...";
     }
 
-    // ========== 高亮相关方法 ==========
     private Set<String> tokenizeForHighlight(String question) {
         String[] words = question.split("[，。！？；、\\s,.!?;:：\n]+");
         Set<String> result = new HashSet<>();
@@ -308,21 +332,20 @@ public class ChatService {
         return result;
     }
 
-    /**
-     * 从模型回答中提取引用的来源
-     * 格式: [来源: 《文档名称》 第N段]
-     * 返回: Set<"文档名称:段号">
-     */
     private Set<String> extractCitedSources(String answer) {
         Set<String> sources = new HashSet<>();
-        // 匹配 [来源: 《八股文.pdf》 第130段]
-        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
-                "\\[来源: 《(.+?)》 第(\\d+)段\\]"
+        // 支持多种格式：
+        // [来源: 《xxx》 第N段]
+        // 【来源: 《xxx》 第N段】
+        // 来源: 《xxx》 第N段
+        // 《xxx》第N段
+        Pattern pattern = Pattern.compile(
+                "[【\\[]?来源[:：]?\\s*《(.+?)》\\s*第\\s*(\\d+)\\s*段[】\\]]?"
         );
-        java.util.regex.Matcher matcher = pattern.matcher(answer);
+        Matcher matcher = pattern.matcher(answer);
         while (matcher.find()) {
-            String docName = matcher.group(1);
-            String index = matcher.group(2);
+            String docName = matcher.group(1).trim();
+            String index = matcher.group(2).trim();
             sources.add(docName + ":" + index);
         }
         return sources;
