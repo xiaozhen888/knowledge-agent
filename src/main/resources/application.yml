@@ -20,9 +20,9 @@ spring:
 
   # MySQL配置
   datasource:
-    url: jdbc:mysql://mysql:3306/knowledge_agent?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
-    username: root
-    password: mysql666@
+    url: jdbc:mysql://${MYSQL_HOST:localhost}:${MYSQL_PORT:3306}/knowledge_agent?useSSL=false&allowPublicKeyRetrieval=true&characterEncoding=UTF-8
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
   jpa:
     hibernate:
@@ -38,10 +38,18 @@ spring:
 langchain4j:
   openai:
     api-key: ${DEEPSEEK_API_KEY}
-    base-url: https://api.deepseek.com/v1
-    model-name: deepseek-chat
-    
+    base-url: ${DEEPSEEK_BASE_URL:https://api.deepseek.com/v1}
+    model-name: ${DEEPSEEK_MODEL:deepseek-chat}
+
 reranker:
   model:
-    max-length: 512
-  batch-size: 8
+    max-length: 256
+  batch-size: 32
+
+# 文件存储路径
+app:
+  storage:
+    path: ${FILE_STORAGE_PATH:/data/files}
+  # API鉴权（空则不校验）
+  auth:
+    api-key: ${API_KEY:}
