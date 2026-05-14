@@ -3,6 +3,7 @@ package com.xiaozhen.knowledgeagent.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xiaozhen.knowledgeagent.model.CachedAnswer;
 import com.xiaozhen.knowledgeagent.model.ChunkResult;
 import com.xiaozhen.knowledgeagent.model.Document;
 import com.xiaozhen.knowledgeagent.model.ChatHistory;
@@ -25,6 +26,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -41,6 +43,7 @@ public class ChatService {
     private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final RerankService rerankService;
+    private final HotQuestionCacheService hotCache;
     private static final Logger logger = LoggerFactory.getLogger(ChatService.class);
 
     @Value("${langchain4j.openai.api-key}")
@@ -65,6 +68,35 @@ public class ChatService {
     }
 
     public String ask(String sessionId, String question) throws JsonProcessingException {
+        long startTime = System.currentTimeMillis();
+        String q = question.trim();
+
+        // ========== 【新增】第1步：查热点缓存 ==========
+        CachedAnswer cached = hotCache.get(q);
+        if (cached != null) {
+            // 命中缓存，保存历史后直接返回（跳过敏检+向量+LLM）
+            ChatHistory ch = new ChatHistory(sessionId, q, cached.getAnswer());
+            chatHistoryRepository.save(ch);
+            logger.info("🎯 热点缓存命中，question={}, 耗时={}ms", q, System.currentTimeMillis() - startTime);
+            try {
+                String historyKey = "chat:history:" + sessionId;
+                String historyJson = redisTemplate.opsForValue().get(historyKey);
+                List<Map<String, String>> history = historyJson != null
+                        ? objectMapper.readValue(historyJson, new TypeReference<>(){})
+                        : new ArrayList<>();
+
+                Map<String, String> turn = new HashMap<>();
+                turn.put("user", q);
+                turn.put("assistant", cached.getAnswer());
+                history.add(turn);
+                if (history.size() > 10) history.remove(0);
+
+                redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
+            } catch (Exception ignored) {}
+            return cached.getAnswer();
+        }
+
+        // ========== 第2步：未命中，走原有 RAG 流程（以下全部保持原样） ==========
         List<Document> activeDocs = documentRepository.findByActiveTrueAndDeletedFalse();
 
         List<ChunkResult> allChunkResults = new ArrayList<>();
@@ -143,17 +175,39 @@ public class ChatService {
 
         logger.info("融合去重后候选集: {} 个", allCandidates.size());
 
-        // ========== 新增：如果候选太多，只保留Top100 ==========
-        if (allCandidates.size() > 100) {
+        // ========== 新增：如果候选太多，只保留Top15 ==========
+        if (allCandidates.size() > 8) {
             allCandidates = allCandidates.stream()
                     .sorted((a, b) -> Double.compare(b.getScore(), a.getScore()))
-                    .limit(100)
+                    .limit(8)
                     .collect(Collectors.toList());
             logger.info("截断后候选集: {} 个", allCandidates.size());
         }
 
-        // ========== 5. 精排（Top-30） ==========
-        List<ChunkResult> relevantChunks = rerankService.rerank(allCandidates, question, 30);
+        // ========== 5. 精排结果缓存 ==========
+        String rerankKey = "rerank:" + question.trim();
+        String cachedRerankJson = redisTemplate.opsForValue().get(rerankKey);
+        List<ChunkResult> relevantChunks;
+
+        if (cachedRerankJson != null) {
+            try {
+                relevantChunks = objectMapper.readValue(cachedRerankJson, new TypeReference<List<ChunkResult>>() {});
+                logger.info("🚀 精排结果缓存命中，跳过精排");
+            } catch (Exception e) {
+                logger.warn("精排缓存反序列化失败，重新精排", e);
+                relevantChunks = rerankService.rerank(allCandidates, question, 8);
+                // 缓存结果
+                try {
+                    redisTemplate.opsForValue().set(rerankKey, objectMapper.writeValueAsString(relevantChunks), 1, TimeUnit.HOURS);
+                } catch (Exception ignored) {}
+            }
+        } else {
+            relevantChunks = rerankService.rerank(allCandidates, question, 8);
+            // 缓存结果
+            try {
+                redisTemplate.opsForValue().set(rerankKey, objectMapper.writeValueAsString(relevantChunks), 1, TimeUnit.HOURS);
+            } catch (Exception ignored) {}
+        }
 
         if (relevantChunks.isEmpty()) {
             logger.warn("精排后无有效候选，问题: {}", question);
@@ -168,7 +222,8 @@ public class ChatService {
         }
 
         StringBuilder context = new StringBuilder();
-        for (int i = 0; i < relevantChunks.size(); i++) {
+        int contextLimit = Math.min(relevantChunks.size(), 8); // 限制进 prompt 的片段数
+        for (int i = 0; i < contextLimit; i++) {
             ChunkResult chunk = relevantChunks.get(i);
             context.append("{片段").append(i + 1).append("}\n");
             context.append(chunk.getContent()).append("\n");
@@ -297,6 +352,11 @@ public class ChatService {
         } catch (Exception e) {
         }
 
+        // ========== 【新增】第3步：异步记录，自动晋升热点 ==========
+        final String finalAnswerForCache = finalAnswer;
+        final List<String> finalSources = citedSources.stream().toList();
+        CompletableFuture.runAsync(() -> hotCache.recordQuestion(q, finalAnswerForCache, finalSources));
+
         return finalAnswer;
     }
 
@@ -349,5 +409,17 @@ public class ChatService {
             sources.add(docName + ":" + index);
         }
         return sources;
+    }
+
+    /**
+     * 缓存精排结果到Redis
+     */
+    private void cacheRerankResult(String key, List<ChunkResult> chunks) {
+        try {
+            redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(chunks), 1, TimeUnit.HOURS);
+            logger.info("精排结果已缓存: {}", key);
+        } catch (Exception e) {
+            logger.warn("精排结果缓存失败", e);
+        }
     }
 }
