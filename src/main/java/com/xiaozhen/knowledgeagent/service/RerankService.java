@@ -107,25 +107,21 @@ public class RerankService {
 
             float[] scores = batchInfer(question, contents);
 
+            // ========== sigmoid 归一化 ==========
             for (int i = 0; i < candidates.size(); i++) {
-                candidates.get(i).setScore(scores[i]);
+                float rawScore = scores[i];
+                float normalizedScore = (float) (1.0 / (1.0 + Math.exp(-rawScore)));
+                candidates.get(i).setScore(normalizedScore);
             }
 
-            // 直接按分数排序取 TopK，不再阈值过滤
             List<ChunkResult> sorted = candidates.stream()
                     .sorted((a, b) -> Double.compare(b.getScore(), a.getScore()))
                     .limit(Math.min(topK, candidates.size()))
                     .collect(Collectors.toList());
 
-            logger.debug("Cross-Encoder精排完成，候选{}个，取Top{}，耗时{}ms",
-                    candidates.size(), sorted.size(), System.currentTimeMillis() - startTime);
-
-            if (!sorted.isEmpty()) {
-                logger.debug("精排分数分布: Top1={}, Top3={}, Top5={}",
-                        sorted.get(0).getScore(),
-                        sorted.size() > 2 ? sorted.get(2).getScore() : "N/A",
-                        sorted.size() > 4 ? sorted.get(4).getScore() : "N/A");
-            }
+            logger.info("Cross-Encoder精排完成，候选{}个，取Top{}，耗时{}ms，分数范围[{:.3f}, {:.3f}]",
+                    candidates.size(), sorted.size(), System.currentTimeMillis() - startTime,
+                    sorted.get(sorted.size()-1).getScore(), sorted.get(0).getScore());
 
             return sorted;
 

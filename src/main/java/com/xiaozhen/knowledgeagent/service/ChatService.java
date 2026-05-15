@@ -55,6 +55,45 @@ public class ChatService {
     @Value("${langchain4j.openai.model-name}")
     private String modelName;
 
+    // ========== 【新增】可配置的RAG参数 ==========
+    /** 向量检索最小相似度阈值，低于此值的片段视为不相关 */
+    private static final double VECTOR_MIN_SCORE = 0.45;
+
+    /** 向量检索召回数量 */
+//    private static final int VECTOR_TOP_K = 50;
+
+    /** 每个窗口的片段 */
+    private static final int windowSize = 100;
+
+    /** 滑动步长 */
+    private static final int stride= 50;
+
+    /** 每个窗口取TopK */
+    private static final int topKPerWindow= 10;
+
+    /** 关键词检索召回数量 */
+    private static final int KEYWORD_TOP_K = 20;
+
+    /** 粗排融合后保留的最大候选数，送给Reranker */
+    private static final int FUSION_MAX_CANDIDATES = 20;
+
+    /** Reranker精排后取TopK */
+    private static final int RERANK_TOP_K = 12;
+
+    /** 最终进入Prompt的片段数 */
+    private static final int PROMPT_MAX_CHUNKS = 12;
+
+    /** 多轮对话历史最大轮数 */
+    private static final int MAX_HISTORY_TURNS = 10;
+
+    /** Redis缓存过期时间（分钟） */
+    private static final int HISTORY_CACHE_MINUTES = 30;
+    private static final int QUERY_EMBED_CACHE_MINUTES = 10;
+    private static final int RERANK_CACHE_HOURS = 1;
+
+    /** 精排后质量过滤 */
+    private static final double MIN_RERANK_SCORE = 0.3;
+
     private ChatLanguageModel model;
 
     @PostConstruct
@@ -71,32 +110,17 @@ public class ChatService {
         long startTime = System.currentTimeMillis();
         String q = question.trim();
 
-        // ========== 【新增】第1步：查热点缓存 ==========
+        // ========== 第1步：查热点缓存 ==========
         CachedAnswer cached = hotCache.get(q);
         if (cached != null) {
-            // 命中缓存，保存历史后直接返回（跳过敏检+向量+LLM）
             ChatHistory ch = new ChatHistory(sessionId, q, cached.getAnswer());
             chatHistoryRepository.save(ch);
             logger.info("🎯 热点缓存命中，question={}, 耗时={}ms", q, System.currentTimeMillis() - startTime);
-            try {
-                String historyKey = "chat:history:" + sessionId;
-                String historyJson = redisTemplate.opsForValue().get(historyKey);
-                List<Map<String, String>> history = historyJson != null
-                        ? objectMapper.readValue(historyJson, new TypeReference<>(){})
-                        : new ArrayList<>();
-
-                Map<String, String> turn = new HashMap<>();
-                turn.put("user", q);
-                turn.put("assistant", cached.getAnswer());
-                history.add(turn);
-                if (history.size() > 10) history.remove(0);
-
-                redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
-            } catch (Exception ignored) {}
+            updateRedisHistory(sessionId, q, cached.getAnswer());
             return cached.getAnswer();
         }
 
-        // ========== 第2步：未命中，走原有 RAG 流程（以下全部保持原样） ==========
+        // ========== 第2步：召回阶段 ==========
         List<Document> activeDocs = documentRepository.findByActiveTrueAndDeletedFalse();
 
         List<ChunkResult> allChunkResults = new ArrayList<>();
@@ -129,6 +153,7 @@ public class ChatService {
             return "请先上传文档再提问";
         }
 
+        // ========== 第3步：获取问题向量 ==========
         String questionEmbeddingKey = "embedding:query:" + sessionId;
         String cachedQueryJson = redisTemplate.opsForValue().get(questionEmbeddingKey);
         float[] queryVector;
@@ -137,54 +162,63 @@ public class ChatService {
             queryVector = objectMapper.readValue(cachedQueryJson, float[].class);
         } else {
             queryVector = embeddingService.embed(question);
-            redisTemplate.opsForValue().set(questionEmbeddingKey, objectMapper.writeValueAsString(queryVector), 10, TimeUnit.MINUTES);
+            redisTemplate.opsForValue().set(questionEmbeddingKey, objectMapper.writeValueAsString(queryVector),
+                    QUERY_EMBED_CACHE_MINUTES, TimeUnit.MINUTES);
         }
 
+        // ========== 第4步：多路召回 ==========
         List<String> allContents = allChunkResults.stream()
                 .map(ChunkResult::getContent)
                 .collect(Collectors.toList());
 
-        List<String> keywordContents = vectorService.searchRelevant(allContents, question, 15);
+        // 4.1 关键词路召回
+        List<String> keywordContents = vectorService.searchRelevant(allContents, question, KEYWORD_TOP_K);
         Set<String> keywordSet = new HashSet<>(keywordContents);
         List<ChunkResult> keywordResults = allChunkResults.stream()
                 .filter(c -> keywordSet.contains(c.getContent()))
                 .collect(Collectors.toList());
 
-        List<VectorService.ScoredChunk> vectorScored = vectorService.searchByEmbeddingWithScore(
-                allEmbeddings, queryVector, 30, 0.0);
+        // 4.2 向量路召回（增加合理阈值，避免召回大量低质量片段）
+        // 滑动窗口检索（替代全局检索）
+        List<ChunkResult> embeddingResults = searchWithSlidingWindow(
+                allChunkResults, allEmbeddings, queryVector, question,
+                windowSize,
+                stride,
+                topKPerWindow,
+                VECTOR_MIN_SCORE);
 
-        List<ChunkResult> embeddingResults = new ArrayList<>();
-        for (VectorService.ScoredChunk sc : vectorScored) {
-            ChunkResult cr = allChunkResults.get(sc.index);
-            cr.setScore(sc.score);
-            embeddingResults.add(cr);
-        }
+        logger.info("关键词路召回: {} 个, 向量路(滑动窗口)召回: {} 个 (阈值:{})",
+                keywordResults.size(), embeddingResults.size(), VECTOR_MIN_SCORE);
 
-        logger.info("关键词路召回: {} 个, 向量路召回: {} 个)",
-                keywordResults.size(), embeddingResults.size());
-
-        // ========== 4. 融合去重 ==========
+        // ========== 第5步：融合去重（粗排） ==========
         Set<String> seen = new HashSet<>();
         List<ChunkResult> allCandidates = new ArrayList<>();
-        for (ChunkResult c : keywordResults) {
-            if (seen.add(c.getContent())) allCandidates.add(c);
-        }
+
+        // 先加入向量路结果（语义相关度通常更高）
         for (ChunkResult c : embeddingResults) {
             if (seen.add(c.getContent())) allCandidates.add(c);
+        }
+        // 再加入关键词路结果
+        for (ChunkResult c : keywordResults) {
+            if (seen.add(c.getContent())) {
+                // 关键词路没有score，给个默认中间值
+                c.setScore(0.5);
+                allCandidates.add(c);
+            }
         }
 
         logger.info("融合去重后候选集: {} 个", allCandidates.size());
 
-        // ========== 新增：如果候选太多，只保留Top15 ==========
-        if (allCandidates.size() > 8) {
+        // ========== 粗排截断阈值提高，让更多候选进入精排 ==========
+        if (allCandidates.size() > FUSION_MAX_CANDIDATES) {
             allCandidates = allCandidates.stream()
                     .sorted((a, b) -> Double.compare(b.getScore(), a.getScore()))
-                    .limit(8)
+                    .limit(FUSION_MAX_CANDIDATES)
                     .collect(Collectors.toList());
-            logger.info("截断后候选集: {} 个", allCandidates.size());
+            logger.info("粗排截断后候选集: {} 个 (阈值:{})", allCandidates.size(), FUSION_MAX_CANDIDATES);
         }
 
-        // ========== 5. 精排结果缓存 ==========
+        // ========== 第6步：精排 ==========
         String rerankKey = "rerank:" + question.trim();
         String cachedRerankJson = redisTemplate.opsForValue().get(rerankKey);
         List<ChunkResult> relevantChunks;
@@ -195,34 +229,50 @@ public class ChatService {
                 logger.info("🚀 精排结果缓存命中，跳过精排");
             } catch (Exception e) {
                 logger.warn("精排缓存反序列化失败，重新精排", e);
-                relevantChunks = rerankService.rerank(allCandidates, question, 8);
-                // 缓存结果
-                try {
-                    redisTemplate.opsForValue().set(rerankKey, objectMapper.writeValueAsString(relevantChunks), 1, TimeUnit.HOURS);
-                } catch (Exception ignored) {}
+                relevantChunks = rerankService.rerank(allCandidates, question, RERANK_TOP_K);
+                cacheRerankResult(rerankKey, relevantChunks);
             }
         } else {
-            relevantChunks = rerankService.rerank(allCandidates, question, 8);
-            // 缓存结果
-            try {
-                redisTemplate.opsForValue().set(rerankKey, objectMapper.writeValueAsString(relevantChunks), 1, TimeUnit.HOURS);
-            } catch (Exception ignored) {}
+            relevantChunks = rerankService.rerank(allCandidates, question, RERANK_TOP_K);
+            cacheRerankResult(rerankKey, relevantChunks);
         }
 
         if (relevantChunks.isEmpty()) {
-            logger.warn("精排后无有效候选，问题: {}", question);
+            logger.warn("精排后无有效候选（全部低于阈值{}），问题: {}", question);
             return "根据提供的文档，无法找到相关信息。";
         }
 
-        logger.info("精排后Top片段:");
-        for (int i = 0; i < Math.min(3, relevantChunks.size()); i++) {
+        // ========== 1. 精排后过滤低分片段 ==========
+        List<ChunkResult> filteredChunks = relevantChunks.stream()
+                .filter(c -> c.getScore() >= MIN_RERANK_SCORE)
+                .collect(Collectors.toList());
+
+        logger.info("精排过滤前: {} 个, 过滤后: {} 个 (阈值:{})",
+                relevantChunks.size(), filteredChunks.size(), MIN_RERANK_SCORE);
+
+        //判断过滤后的列表是否为空
+        if (filteredChunks.isEmpty()) {
+            logger.warn("精排后无有效候选（全部低于阈值{}），问题: {}", MIN_RERANK_SCORE, question);
+            //兜底：取Top3.避免完全没答案
+            filteredChunks = relevantChunks.subList(0, Math.min(3, relevantChunks.size()));
+        }
+        //替换为过滤后的列表
+        relevantChunks = filteredChunks;
+
+        // ========== 2. 计算进入 Prompt 的片段数 ==========
+        int contextLimit = Math.min(relevantChunks.size(), PROMPT_MAX_CHUNKS);
+        logger.info("本次进入Prompt的片段数: {}/{}", contextLimit, relevantChunks.size());
+
+        // ========== 3. 打印 + 构建（统一用 relevantChunks） ==========
+        logger.info("精排后Top片段 (共{}个进Prompt):", contextLimit);
+        for (int i = 0; i < contextLimit; i++) {
             ChunkResult c = relevantChunks.get(i);
-            String preview = c.getContent().substring(0, Math.min(80, c.getContent().length()));
-            logger.info("  Top{}: score={}, content={}", i + 1, c.getScore(), preview);
+            String preview = c.getContent().substring(0, Math.min(60, c.getContent().length()));
+            logger.info("  Top{}: score={}, doc={}, chunk={}, content={}",
+                    i + 1, String.format("%.3f", c.getScore()), c.getDocName(), c.getChunkIndex(), preview);
         }
 
         StringBuilder context = new StringBuilder();
-        int contextLimit = Math.min(relevantChunks.size(), 8); // 限制进 prompt 的片段数
         for (int i = 0; i < contextLimit; i++) {
             ChunkResult chunk = relevantChunks.get(i);
             context.append("{片段").append(i + 1).append("}\n");
@@ -231,6 +281,7 @@ public class ChatService {
                     .append("》 第").append(chunk.getChunkIndex()).append("段]\n\n");
         }
 
+        // ========== 第7步：构建历史对话 ==========
         String historyKey = "chat:history:" + sessionId;
         String historyJson = redisTemplate.opsForValue().get(historyKey);
         List<Map<String, String>> history = new ArrayList<>();
@@ -251,8 +302,10 @@ public class ChatService {
                     history.add(turn);
                 }
                 try {
-                    redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
+                    redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history),
+                            HISTORY_CACHE_MINUTES, TimeUnit.MINUTES);
                 } catch (Exception e) {
+                    logger.warn("历史对话缓存失败", e);
                 }
             }
         }
@@ -274,16 +327,31 @@ public class ChatService {
             redisTemplate.delete(dislikeKey);
         }
 
+        // ========== 动态调整进 Prompt 的片段数 ==========
+        if (relevantChunks.get(0).getScore() > 0.9) {
+            contextLimit = Math.min(3, relevantChunks.size());
+        } else if (relevantChunks.get(0).getScore() > 0.5) {
+            contextLimit = Math.min(8, relevantChunks.size());
+        } else {
+            contextLimit = Math.min(PROMPT_MAX_CHUNKS, relevantChunks.size());
+        }
+        logger.info("动态调整进Prompt片段数: {}/{} (Top1分数:{})",
+                contextLimit, relevantChunks.size(), String.format("%.3f", relevantChunks.get(0).getScore()));
+
+        // ========== 第8步：构建Prompt ==========
         String prompt = """
                         你是一位严谨的文档问答助手。请严格遵循以下规则：
                     
                         【规则】
-                        1. 必须仅基于下方提供的【参考文档片段】回答问题，禁止引用片段外的任何知识
-                        2. 如果参考片段无法回答问题，必须明确回答："根据提供的文档，无法找到相关信息"
-                        3. 回答时必须标注信息来源，格式为：[来源: 《文档名称》 第{index}段]
-                        4. 每个事实后必须紧跟来源标注，禁止在回答末尾统一标注
-                        5. 禁止编造、推测、扩展文档中不存在的内容
-                        6. 如果多个片段冲突，优先采用最新或最具体的片段
+                        1. 必须仅基于下方提供的【参考文档片段】回答问题
+                        2.【重要】如果片段中包含与问题相关的信息，即使不是直接回答，也请提取并整合后回答，不要直接说"无法找到"
+                        3. 如果片段中确实完全没有相关信息，再回答："根据提供的文档，无法找到相关信息"
+                        4. 回答时必须标注信息来源，格式为：[来源: 《文档名称》 第{index}段]
+                        5. 每个事实后必须紧跟来源标注，禁止在回答末尾统一标注
+                        6. 禁止编造、推测、扩展文档中不存在的内容
+                        7.【重要】如果答案分布在多个片段中，请阅读相关片段后，拼接完整信息后再回答，禁止只用部分片段回答
+                        8.【重要】不要过度追求简洁，请给出完整、详细的回答，确保覆盖所有相关片段中的关键信息
+                        9.【重要】禁止在回答中写"原文在此处截断""未完待续"等提示语，必须根据已有片段给出完整回答
                     
                         %s
                         【参考文档片段】
@@ -293,24 +361,23 @@ public class ChatService {
                         %s
                     
                         【回答要求】
-                        - 先给出简洁答案（1-2句话）
-                        - 如需详细说明，使用分点形式
+                        - 仔细阅读所有片段，判断哪些片段共同回答了问题
+                        - 如果多个片段内容互补，请合并后给出完整回答
                         - 每个事实后标注来源，格式：[来源: 《文档名称》 第N段]
                         - 禁止输出Markdown格式
                         - 禁止在回答末尾列出所有来源
-                        """
+                """
                 .formatted(historyPrompt.toString(), context.toString(), question);
 
         String answer = model.generate(prompt);
 
-        // ========== 9. 尝试解析模型引用的来源（仅用于日志观察） ==========
+        // ========== 第9步：解析引用来源 ==========
         Set<String> citedSources = extractCitedSources(answer);
         logger.info("模型引用了 {} 个来源: {}", citedSources.size(), citedSources);
 
-        // ========== 10. 拼接溯源信息：只展示模型实际引用的片段 ==========
+        // ========== 第10步：拼接溯源信息 ==========
         StringBuilder sourceInfo = new StringBuilder();
 
-        // 严格过滤：只保留模型实际标注了来源的片段
         List<ChunkResult> citedChunks = new ArrayList<>();
         for (ChunkResult chunk : relevantChunks) {
             String sourceKey = chunk.getDocName() + ":" + chunk.getChunkIndex();
@@ -319,7 +386,6 @@ public class ChatService {
             }
         }
 
-        // 如果模型一个都没标注，兜底展示Top3（避免完全没来源）
         if (citedChunks.isEmpty()) {
             logger.warn("模型未标注任何来源，兜底展示Top3");
             citedChunks = relevantChunks.subList(0, Math.min(3, relevantChunks.size()));
@@ -337,27 +403,44 @@ public class ChatService {
 
         String finalAnswer = answer + sourceInfo.toString();
 
+        // ========== 第11步：保存历史 ==========
         ChatHistory ch = new ChatHistory(sessionId, question, answer);
         chatHistoryRepository.save(ch);
 
-        Map<String, String> turn = new HashMap<>();
-        turn.put("user", question);
-        turn.put("assistant", answer);
-        history.add(turn);
-        if (history.size() > 10) {
-            history.remove(0);
-        }
-        try {
-            redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history), 30, TimeUnit.MINUTES);
-        } catch (Exception e) {
-        }
+        updateRedisHistory(sessionId, question, answer);
 
-        // ========== 【新增】第3步：异步记录，自动晋升热点 ==========
+        // ========== 第12步：异步记录热点 ==========
         final String finalAnswerForCache = finalAnswer;
         final List<String> finalSources = citedSources.stream().toList();
         CompletableFuture.runAsync(() -> hotCache.recordQuestion(q, finalAnswerForCache, finalSources));
 
         return finalAnswer;
+    }
+
+    /**
+     * 更新Redis中的对话历史
+     */
+    private void updateRedisHistory(String sessionId, String question, String answer) {
+        try {
+            String historyKey = "chat:history:" + sessionId;
+            String historyJson = redisTemplate.opsForValue().get(historyKey);
+            List<Map<String, String>> history = historyJson != null
+                    ? objectMapper.readValue(historyJson, new TypeReference<List<Map<String, String>>>() {})
+                    : new ArrayList<>();
+
+            Map<String, String> turn = new HashMap<>();
+            turn.put("user", question);
+            turn.put("assistant", answer);
+            history.add(turn);
+            if (history.size() > MAX_HISTORY_TURNS) {
+                history.remove(0);
+            }
+
+            redisTemplate.opsForValue().set(historyKey, objectMapper.writeValueAsString(history),
+                    HISTORY_CACHE_MINUTES, TimeUnit.MINUTES);
+        } catch (Exception e) {
+            logger.warn("更新Redis历史失败", e);
+        }
     }
 
     public String ask(String question) {
@@ -374,7 +457,7 @@ public class ChatService {
     }
 
     private Set<String> tokenizeForHighlight(String question) {
-        String[] words = question.split("[，。！？；、\\s,.!?;:：\n]+");
+        String[] words = question.split("[，。！？；、\s,.!?;:：\n]+");
         Set<String> result = new HashSet<>();
         for (String word : words) {
             if (word.trim().length() >= 2) {
@@ -394,11 +477,6 @@ public class ChatService {
 
     private Set<String> extractCitedSources(String answer) {
         Set<String> sources = new HashSet<>();
-        // 支持多种格式：
-        // [来源: 《xxx》 第N段]
-        // 【来源: 《xxx》 第N段】
-        // 来源: 《xxx》 第N段
-        // 《xxx》第N段
         Pattern pattern = Pattern.compile(
                 "[【\\[]?来源[:：]?\\s*《(.+?)》\\s*第\\s*(\\d+)\\s*段[】\\]]?"
         );
@@ -416,10 +494,119 @@ public class ChatService {
      */
     private void cacheRerankResult(String key, List<ChunkResult> chunks) {
         try {
-            redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(chunks), 1, TimeUnit.HOURS);
+            redisTemplate.opsForValue().set(key, objectMapper.writeValueAsString(chunks),
+                    RERANK_CACHE_HOURS, TimeUnit.HOURS);
             logger.info("精排结果已缓存: {}", key);
         } catch (Exception e) {
             logger.warn("精排结果缓存失败", e);
         }
+    }
+
+    // 预合并逻辑：相邻 chunk 且内容相关（都包含关键词）就合并
+    private List<ChunkResult> mergeRelatedChunks(List<ChunkResult> chunks) {
+        if (chunks.isEmpty()) return chunks;
+
+        List<ChunkResult> merged = new ArrayList<>();
+        StringBuilder currentContent = new StringBuilder(chunks.get(0).getContent());
+        String currentDoc = chunks.get(0).getDocName();
+        int currentStartIdx = chunks.get(0).getChunkIndex();
+        double currentScore = chunks.get(0).getScore();
+
+        for (int i = 1; i < chunks.size(); i++) {
+            ChunkResult next = chunks.get(i);
+
+            // 判断是否应该合并：同一文档、相邻索引、分数差距不大
+            boolean shouldMerge = next.getDocName().equals(currentDoc)
+                    && next.getChunkIndex() == currentStartIdx + (i - merged.size())  // 相邻
+                    && Math.abs(next.getScore() - currentScore) < 0.5;  // 分数差距不大
+
+            if (shouldMerge) {
+                currentContent.append("\n").append(next.getContent());
+                currentScore = Math.max(currentScore, next.getScore()); // 取最高分
+            } else {
+                // 保存当前合并块
+                ChunkResult combined = new ChunkResult(
+                        currentContent.toString(),
+                        chunks.get(i - 1).getDocId(),
+                        currentDoc,
+                        currentStartIdx
+                );
+                combined.setScore(currentScore);
+                merged.add(combined);
+
+                // 开始新块
+                currentContent = new StringBuilder(next.getContent());
+                currentDoc = next.getDocName();
+                currentStartIdx = next.getChunkIndex();
+                currentScore = next.getScore();
+            }
+        }
+
+        // 保存最后一个
+        ChunkResult last = chunks.get(chunks.size() - 1);
+        ChunkResult combined = new ChunkResult(
+                currentContent.toString(),
+                last.getDocId(),
+                currentDoc,
+                currentStartIdx
+        );
+        combined.setScore(currentScore);
+        merged.add(combined);
+
+        logger.info("相邻片段合并: {} 个 → {} 个", chunks.size(), merged.size());
+        return merged;
+    }
+
+    /**
+     * 滑动窗口检索：将长文档分成多个重叠窗口，每个窗口单独检索，避免前面片段淹没后面片段
+     */
+    private List<ChunkResult> searchWithSlidingWindow(
+            List<ChunkResult> allChunks,
+            List<float[]> allEmbeddings,
+            float[] queryVector,
+            String question,
+            int windowSize,
+            int stride,
+            int topKPerWindow,
+            double minScore) {
+
+        int totalChunks = allChunks.size();
+        List<ChunkResult> allWindowResults = new ArrayList<>();
+
+        logger.info("滑动窗口检索开始: 总片段{}个, 窗口大小{}, 步长{}", totalChunks, windowSize, stride);
+
+        for (int start = 0; start < totalChunks; start += stride) {
+            int end = Math.min(start + windowSize, totalChunks);
+
+            // 提取当前窗口
+            List<ChunkResult> windowChunks = allChunks.subList(start, end);
+            List<float[]> windowEmbeddings = allEmbeddings.subList(start, end);
+
+            // 窗口内检索
+            List<VectorService.ScoredChunk> windowScored = vectorService.searchByEmbeddingWithScore(
+                    windowEmbeddings, queryVector, topKPerWindow, minScore);
+
+            // 转换回全局索引
+            for (VectorService.ScoredChunk sc : windowScored) {
+                int globalIndex = start + sc.index;
+                ChunkResult cr = allChunks.get(globalIndex);
+                cr.setScore(sc.score);
+                allWindowResults.add(cr);
+            }
+
+            logger.debug("窗口 [{}-{}] 检索到 {} 个结果", start, end - 1, windowScored.size());
+        }
+
+        // 去重 + 按分数排序
+        Set<String> seen = new HashSet<>();
+        List<ChunkResult> uniqueResults = allWindowResults.stream()
+                .filter(c -> seen.add(c.getContent()))
+                .sorted((a, b) -> Double.compare(b.getScore(), a.getScore()))
+                .collect(Collectors.toList());
+
+        logger.info("滑动窗口检索完成: 共{}个窗口, 合并去重后{}个结果",
+                (totalChunks + stride - 1) / stride, uniqueResults.size());
+
+        return uniqueResults;
     }
 }
