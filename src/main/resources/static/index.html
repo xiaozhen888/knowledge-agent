@@ -100,7 +100,6 @@
             max-height: 200px;
             overflow-y: auto;
         }
-
         .feedback-btns {
             display: flex;
             gap: 8px;
@@ -116,6 +115,15 @@
         }
         .fb-btn:hover {
             background: #f3f4f6;
+        }
+        .citation {
+            color: #6b7280;
+            font-size: 12px;
+            background: #f3f4f6;
+            padding: 1px 4px;
+            border-radius: 4px;
+            margin-left: 4px;
+            font-style: normal;
         }
     </style>
 </head>
@@ -200,6 +208,9 @@
             const res = await fetch('/api/document/' + id + '/reparse', { method: 'POST' });
             const text = await res.text();
             alert(text);
+
+            loadDocList();  //立即刷新
+
             // 提取新文档ID（后端返回格式：重新解析已提交，新文档ID: xxxxxxxx）
             const match = text.match(/新文档ID:\s*(\w+)/);
             if (match) {
@@ -208,9 +219,11 @@
                 let retries = 0;
                 while (retries < 15) { // 最多等15秒
                     await new Promise(r => setTimeout(r, 1000));
+                    loadDocList();  //每秒刷新，实时更新状态
                     const statusRes = await fetch('/api/document/status/' + newId);
                     const status = await statusRes.text();
                     if (status === 'SUCCESS' || status.includes('FAILED')) {
+                        loadDocList();
                         break;
                     }
                     retries++;
@@ -253,6 +266,10 @@
             const res = await fetch('/api/document/upload', { method: 'POST', body: formData });
             const text = await res.text();
             statusDiv.innerHTML = '✅ ' + text;
+
+            //立刻刷新列表，不等轮询
+            loadDocList();
+
             // 提取文档ID
             const match = text.match(/文档ID:\s*(\w+)/);
             if (match) {
@@ -260,10 +277,12 @@
                 let retries = 0;
                 while (retries < 15) {
                     await new Promise(r => setTimeout(r, 1000));
+                    loadDocList();  //每秒刷新，实时更新状态
                     try {
                         const statusRes = await fetch('/api/document/status/' + docId);
                         const status = await statusRes.text();
                         if (status === 'SUCCESS' || status.includes('FAILED')) {
+                            loadDocList(); //状态变更时刷新列表
                             break;
                         }
                     } catch (e) {
@@ -272,7 +291,7 @@
                     retries++;
                 }
             }
-            loadDocList();
+            // loadDocList();
         } catch (e) {
             statusDiv.textContent = '❌ 上传失败: ' + e.message;
         }
@@ -326,6 +345,11 @@
         }
 
         mainAnswer = mainAnswer.replace(/【(.+?)】/g, '<mark>$1</mark>');
+        // 给 [来源: 《xxx》 第x段] 加样式
+        mainAnswer = mainAnswer.replace(
+            /\[来源: 《(.+?)》 第(\d+)段\]/g,
+            '<span class="citation">[来源: 《$1》 第$2段]</span>'
+        );
 
         let sourceHtml = '';
         if (sourcePart) {

@@ -1,5 +1,6 @@
 package com.xiaozhen.knowledgeagent.controller;
 
+import com.xiaozhen.knowledgeagent.config.StorageProperties;
 import com.xiaozhen.knowledgeagent.model.Document;
 import com.xiaozhen.knowledgeagent.repository.DocumentRepository;
 import com.xiaozhen.knowledgeagent.service.DocumentService;
@@ -28,6 +29,7 @@ public class DocumentController {
     private final DocumentRepository documentRepository;
     private final RedisTemplate<String, String> redisTemplate;
     private final RabbitTemplate rabbitTemplate;
+    private final StorageProperties storageProperties;
 
     @PostMapping("/upload")
     public String upload(@RequestParam("file") MultipartFile file) {
@@ -128,7 +130,7 @@ public class DocumentController {
         if (doc == null) return "文档不存在";
 
         // 从本地文件读取原始内容
-        java.io.File dir = new java.io.File("/data/files");
+        java.io.File dir = new java.io.File(storageProperties.getPath());
         java.io.File[] files = dir.listFiles((d, name) -> name.startsWith(id + "_"));
         if (files == null || files.length == 0) return "原始文件不存在，请重新上传";
 

@@ -31,8 +31,6 @@ services:
     container_name: knowledge-agent
     ports:
       - "8080:8080"
-    volumes:
-        - knowledge_files:/data/files
     environment:
       - SPRING_DATA_REDIS_HOST=redis
       - SPRING_RABBITMQ_HOST=rabbitmq
@@ -40,6 +38,14 @@ services:
       - SPRING_DATASOURCE_USERNAME=root
       - SPRING_DATASOURCE_PASSWORD=mysql666@
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - JAVA_OPTS=-Xmx1024m
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+    volumes:
+      - knowledge_files:/data/files
+      - ./models/reranker:/app/models/reranker:ro
     depends_on:
       - redis
       - rabbitmq

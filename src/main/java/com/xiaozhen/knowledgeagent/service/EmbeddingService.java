@@ -13,21 +13,14 @@ public class EmbeddingService {
 
     @PostConstruct
     public void init() {
-        // 首次加载会下载约100MB的模型文件，之后缓存到本地
         embeddingModel = new BgeSmallZhEmbeddingModel();
     }
 
-    /**
-     * 把一段文本转成向量
-     */
     public float[] embed(String text) {
         Embedding embedding = embeddingModel.embed(text).content();
         return embedding.vector();
     }
 
-    /**
-     * 计算两个向量的余弦相似度
-     */
     public double cosineSimilarity(float[] a, float[] b) {
         double dot = 0, normA = 0, normB = 0;
         for (int i = 0; i < a.length; i++) {
