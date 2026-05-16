@@ -84,6 +84,7 @@ public class DocumentController {
         doc.setActive(false);
         doc.setDeleted(true);
         documentRepository.save(doc);
+        redisTemplate.opsForValue().increment("doc:version");
         return "已移入回收站";
     }
 
@@ -94,6 +95,7 @@ public class DocumentController {
         documentRepository.deleteById(id);
         redisTemplate.delete("chunks:" + id);
         redisTemplate.delete("doc:status:" + id);
+        redisTemplate.opsForValue().increment("doc:version");
         return "已彻底删除";
     }
 
@@ -111,6 +113,7 @@ public class DocumentController {
         doc.setActive(true);
         doc.setDeleted(false);
         documentRepository.save(doc);
+        redisTemplate.opsForValue().increment("doc:version");
         return "已恢复";
     }
 
@@ -121,6 +124,7 @@ public class DocumentController {
         if (doc == null) return "文档不存在";
         doc.setActive(!doc.getActive());
         documentRepository.save(doc);
+        redisTemplate.opsForValue().increment("doc:version");
         return doc.getActive() ? "已激活" : "已取消激活";
     }
 
@@ -153,6 +157,7 @@ public class DocumentController {
             redisTemplate.delete("chunks:" + id);
             redisTemplate.delete("embeddings:" + id);
             redisTemplate.delete("doc:status:" + id);
+            redisTemplate.opsForValue().increment("doc:version");
 
             // 发消息重新解析
             DocumentMessage message = new DocumentMessage(newId, content, fileName);

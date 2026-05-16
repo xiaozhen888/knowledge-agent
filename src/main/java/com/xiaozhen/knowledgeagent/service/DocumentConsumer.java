@@ -75,7 +75,9 @@ public class DocumentConsumer {
                 @Override
                 public void afterCommit() {
                     updateStatus(docId, "SUCCESS");
-                    System.out.println("文档 " + docId + " 处理完成，共 " + chunks.size() + " 个片段");
+                    // 文档数据就绪，递增版本号使旧精排缓存失效
+                    redisTemplate.opsForValue().increment("doc:version");
+                    System.out.println("文档 " + docId + " 处理完成，共 " + chunks.size() + " 个片段，精排缓存版本号已递增");
                 }
             });
 

@@ -38,12 +38,15 @@ public class DocumentService {
                     doc.setActive(true);
                     doc.setDeleted(false);
                     documentRepository.save(doc);
+                    // 文档恢复，缓存失效
+                    redisTemplate.opsForValue().increment("doc:version");
                     return "文档已恢复，文档ID: " + doc.getId() + "，请稍后提问";
                 } else {
                     documentRepository.delete(doc);
                     redisTemplate.delete("chunks:" + doc.getId());
                     redisTemplate.delete("embeddings:" + doc.getId());
                     redisTemplate.delete("doc:status:" + doc.getId());
+                    redisTemplate.opsForValue().increment("doc:version");
                     break;
                 }
             }

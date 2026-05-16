@@ -207,8 +207,19 @@ public class ChatService {
             logger.info("粗排截断后候选集: {} 个 (阈值:{})", allCandidates.size(), FUSION_MAX_CANDIDATES);
         }
 
-        // ========== 第8步：精排（缓存key用原始的问题）==========
-        String rerankKey = "rerank:" + q.trim();  // 用原始问题做缓存key
+        // ========== 第8步：精排（缓存key用规范化后的问题+文档版本号）==========
+        String normalizedQ = normalizeQuery(q);
+
+        // 获取当前文档版本号（文档变更时递增）
+        String docVersion = redisTemplate.opsForValue().get("doc:version");
+        if (docVersion == null) {
+            docVersion = "0";
+            redisTemplate.opsForValue().set("doc:version", "0");
+        }
+
+        // 组合成带版本号的缓存 key：rerank:v3:12345678
+        String rerankKey = "rerank:v" + docVersion + ":" + normalizedQ.hashCode();
+
         String cachedRerankJson = redisTemplate.opsForValue().get(rerankKey);
         List<ChunkResult> relevantChunks;
 
@@ -565,5 +576,15 @@ public class ChatService {
             logger.error("【兜底】LLM调用失败", e);
             return "根据提供的文档，无法找到相关信息。";
         }
+    }
+
+    /**
+     * 规范化查询文本，用于生成稳定的缓存 key
+     */
+    private String normalizeQuery(String q) {
+        return q.trim()
+                .toLowerCase()
+                .replaceAll("[\\p{Punct}\\s]+", "")  // 去掉所有标点和空白
+                .replaceAll("[的了吗呢啊呀]", "");      // 去掉常见语气词
     }
 }
