@@ -44,7 +44,7 @@ public class ChatService {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final RerankService rerankService;
     private final HotQuestionCacheService hotCache;
-    private final QueryRewriteService queryRewriteService;  // 【2.3】查询重写服务
+    private final QueryRewriteService queryRewriteService;
     private static final Logger logger = LoggerFactory.getLogger(ChatService.class);
 
     @Value("${langchain4j.openai.api-key}")
@@ -69,7 +69,7 @@ public class ChatService {
     private static final int HISTORY_CACHE_MINUTES = 30;
     private static final int QUERY_EMBED_CACHE_MINUTES = 10;
     private static final int RERANK_CACHE_HOURS = 1;
-    private static final double MIN_RERANK_SCORE = 0.3;
+    private static final double MIN_RERANK_SCORE = 0.6;
 
     private ChatLanguageModel model;
 
@@ -110,7 +110,7 @@ public class ChatService {
             }
         }
 
-        // ========== 【2.3】第3步：查询重写 ==========
+        // ========== 第3步：查询重写 ==========
         String rewrittenQuestion = queryRewriteService.rewrite(q, history);
         logger.info(" 查询重写: '{}' → '{}'", q, rewrittenQuestion);
 
@@ -177,7 +177,7 @@ public class ChatService {
 
         // 6.2 向量路召回（滑动窗口，用重写后的问题生成的向量）
         List<ChunkResult> embeddingResults = searchWithSlidingWindow(
-                allChunkResults, allEmbeddings, queryVector, rewrittenQuestion,  // 【2.3】传重写后的问题用于日志
+                allChunkResults, allEmbeddings, queryVector, rewrittenQuestion,  // 传重写后的问题用于日志
                 windowSize, stride, topKPerWindow, VECTOR_MIN_SCORE);
 
         logger.info("关键词路召回: {} 个, 向量路(滑动窗口)召回: {} 个 (阈值:{})",
@@ -207,8 +207,8 @@ public class ChatService {
             logger.info("粗排截断后候选集: {} 个 (阈值:{})", allCandidates.size(), FUSION_MAX_CANDIDATES);
         }
 
-        // ========== 第8步：精排（缓存key用重写后的问题）==========
-        String rerankKey = "rerank:" + rewrittenQuestion.trim();  // 用重写后的问题做缓存key
+        // ========== 第8步：精排（缓存key用原始的问题）==========
+        String rerankKey = "rerank:" + q.trim();  // 用原始问题做缓存key
         String cachedRerankJson = redisTemplate.opsForValue().get(rerankKey);
         List<ChunkResult> relevantChunks;
 
@@ -218,11 +218,11 @@ public class ChatService {
                 logger.info("🚀 精排结果缓存命中，跳过精排");
             } catch (Exception e) {
                 logger.warn("精排缓存反序列化失败，重新精排", e);
-                relevantChunks = rerankService.rerank(allCandidates, rewrittenQuestion, RERANK_TOP_K);  // 【2.3】用重写后的问题精排
+                relevantChunks = rerankService.rerank(allCandidates, rewrittenQuestion, RERANK_TOP_K);  // 用重写后的问题精排
                 cacheRerankResult(rerankKey, relevantChunks);
             }
         } else {
-            relevantChunks = rerankService.rerank(allCandidates, rewrittenQuestion, RERANK_TOP_K);  // 【2.3】用重写后的问题精排
+            relevantChunks = rerankService.rerank(allCandidates, rewrittenQuestion, RERANK_TOP_K);  // 用重写后的问题精排
             cacheRerankResult(rerankKey, relevantChunks);
         }
 
@@ -239,10 +239,22 @@ public class ChatService {
         logger.info("精排过滤前: {} 个, 过滤后: {} 个 (阈值:{})",
                 relevantChunks.size(), filteredChunks.size(), MIN_RERANK_SCORE);
 
+        // 兜底策略1：过滤后为空，尝试降低阈值重新过滤
         if (filteredChunks.isEmpty()) {
-            logger.warn("精排后无有效候选（全部低于阈值{}），问题: {}", MIN_RERANK_SCORE, rewrittenQuestion);
-            filteredChunks = relevantChunks.subList(0, Math.min(3, relevantChunks.size()));
+            logger.warn("精排后无有效候选（阈值{}），尝试降低阈值到0.3", MIN_RERANK_SCORE);
+            filteredChunks = relevantChunks.stream()
+                    .filter(c -> c.getScore() >= 0.3)
+                    .collect(Collectors.toList());
         }
+
+        // 兜底策略2：如果原始检索就完全没结果，尝试用LLM基于历史对话回答
+        if (filteredChunks.isEmpty()
+                || relevantChunks.isEmpty()
+                || (!relevantChunks.isEmpty() && relevantChunks.get(0).getScore() < 0.2)){
+            logger.warn("所有检索策略均失败，尝试基于历史对话回答");
+            return fallbackAnswer(sessionId, q, history);
+        }
+
         relevantChunks = filteredChunks;
 
         // ========== 计算进入 Prompt 的片段数 ==========
@@ -325,7 +337,7 @@ public class ChatService {
                         - 禁止输出Markdown格式
                         - 禁止在回答末尾列出所有来源
                 """
-                .formatted(historyPrompt.toString(), context.toString(), q);  // 【2.3】Prompt里用原始问题q
+                .formatted(historyPrompt.toString(), context.toString(), q);  // Prompt里用原始问题q
 
         String answer = model.generate(prompt);
 
@@ -362,15 +374,15 @@ public class ChatService {
         String finalAnswer = answer + sourceInfo.toString();
 
         // ========== 第13步：保存历史（保存原始问题）==========
-        ChatHistory ch = new ChatHistory(sessionId, q, answer);  // 【2.3】保存原始问题
+        ChatHistory ch = new ChatHistory(sessionId, q, answer);  // 保存原始问题
         chatHistoryRepository.save(ch);
 
-        updateRedisHistory(sessionId, q, answer);  // 【2.3】Redis历史也用原始问题
+        updateRedisHistory(sessionId, q, answer);  // Redis历史也用原始问题
 
         // ========== 第14步：异步记录热点（用原始问题）==========
         final String finalAnswerForCache = finalAnswer;
         final List<String> finalSources = citedSources.stream().toList();
-        CompletableFuture.runAsync(() -> hotCache.recordQuestion(q, finalAnswerForCache, finalSources));  // 【2.3】热点缓存用原始问题
+        CompletableFuture.runAsync(() -> hotCache.recordQuestion(q, finalAnswerForCache, finalSources));  // 热点缓存用原始问题
 
         return finalAnswer;
     }
@@ -507,5 +519,51 @@ public class ChatService {
                 (totalChunks + stride - 1) / stride, uniqueResults.size());
 
         return uniqueResults;
+    }
+
+    /**
+     * 兜底回答：当检索完全失败时，基于历史对话尝试回答
+     */
+    private String fallbackAnswer(String sessionId, String question, List<Map<String, String>> history) {
+        // 如果没有历史对话，直接返回无法找到
+        if (history == null || history.isEmpty()) {
+            return "根据提供的文档，无法找到相关信息。";
+        }
+
+        // 构建历史上下文
+        StringBuilder historyContext = new StringBuilder();
+        int start = Math.max(0, history.size() - 5);
+        for (int i = start; i < history.size(); i++) {
+            Map<String, String> turn = history.get(i);
+            historyContext.append("用户：").append(turn.get("user")).append("\n");
+            historyContext.append("助手：").append(turn.get("assistant")).append("\n");
+        }
+
+        String prompt = """
+                        你是一位文档问答助手。由于当前问题在文档中找不到直接答案，请基于历史对话尝试回答。
+                        
+                        要求：
+                        1. 如果历史对话中有相关信息，请整合后回答
+                        2. 如果历史对话中也没有相关信息，明确回答："根据提供的文档，无法找到相关信息"
+                        3. 禁止编造文档中不存在的内容
+                        4. 回答开头标注：【此为基于历史对话的推测回答】
+                        
+                        【历史对话】
+                        %s
+                        
+                        【当前问题】
+                        %s
+                        
+                        【回答】
+                        """.formatted(historyContext.toString(), question);
+
+        try {
+            String answer = model.generate(prompt);
+            logger.info("【兜底】基于历史对话生成回答: '{}'", answer);
+            return answer;
+        } catch (Exception e) {
+            logger.error("【兜底】LLM调用失败", e);
+            return "根据提供的文档，无法找到相关信息。";
+        }
     }
 }
