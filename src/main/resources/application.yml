@@ -53,3 +53,13 @@ app:
   # API鉴权（空则不校验）
   auth:
     api-key: ${API_KEY:}
+
+# 监控配置
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
