@@ -4,7 +4,11 @@ services:
     container_name: redis
     ports:
       - "6379:6379"
-    restart: always
+    volumes:
+      - ./redis-data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    restart: unless-stopped
 
   rabbitmq:
     image: rabbitmq:3-management-alpine
