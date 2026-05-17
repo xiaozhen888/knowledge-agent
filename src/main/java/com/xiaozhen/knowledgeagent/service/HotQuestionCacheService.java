@@ -52,22 +52,29 @@ public class HotQuestionCacheService {
     public void recordQuestion(String question, String answer, List<String> sources) {
         try {
             String q = question.trim();
-            // 计数 +1，24小时滑动窗口（通过设置过期时间实现）
+
+            // 1. 原子计数
             Double count = redisTemplate.opsForZSet().incrementScore(KEY_COUNTER, q, 1);
-            redisTemplate.expire(KEY_COUNTER, 24, TimeUnit.HOURS);
 
-            // 达到阈值且未缓存，自动晋升
-            if (count != null && count >= HOT_THRESHOLD
-                    && !redisTemplate.opsForHash().hasKey(KEY_ANSWERS, q)) {
+            // 2. 设置过期时间（只在 key 不存在时设，避免每次重置 24h）
+            Boolean exists = redisTemplate.hasKey(KEY_COUNTER);
+            if (Boolean.FALSE.equals(exists)) {
+                redisTemplate.expire(KEY_COUNTER, 24, TimeUnit.HOURS);
+            }
 
+            // 3. 达到阈值时，原子晋升（HSETNX）
+            if (count != null && count >= HOT_THRESHOLD) {
                 CachedAnswer ca = new CachedAnswer();
                 ca.setAnswer(answer);
                 ca.setSources(sources);
                 ca.setCachedAt(System.currentTimeMillis());
 
-                redisTemplate.opsForHash().put(KEY_ANSWERS, q,
-                        objectMapper.writeValueAsString(ca));
-                log.info("🔥 问题自动晋升热点缓存: {} ({}次)", q, count.intValue());
+                Boolean success = redisTemplate.opsForHash()
+                        .putIfAbsent(KEY_ANSWERS, q, objectMapper.writeValueAsString(ca));
+
+                if (Boolean.TRUE.equals(success)) {
+                    log.info("问题自动晋升热点缓存: {} ({}次)", q, count.intValue());
+                }
             }
         } catch (Exception e) {
             log.error("热点计数异常", e);
