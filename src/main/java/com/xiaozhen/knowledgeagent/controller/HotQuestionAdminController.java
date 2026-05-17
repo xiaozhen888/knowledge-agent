@@ -1,5 +1,6 @@
 package com.xiaozhen.knowledgeagent.controller;
 
+import com.xiaozhen.knowledgeagent.common.ApiResponse;
 import com.xiaozhen.knowledgeagent.service.HotQuestionCacheService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -19,36 +20,33 @@ public class HotQuestionAdminController {
      * 手动添加热点问题
      */
     @PostMapping
-    public ResponseEntity<String> add(@RequestBody HotQuestionRequest req) {
+    public ApiResponse<String> add(@RequestBody HotQuestionRequest req) {
         hotCache.addHotQuestion(req.getQuestion(), req.getAnswer(), req.getSources());
-        return ResponseEntity.ok("添加成功");
+        return ApiResponse.ok("添加成功");
     }
-
     /**
      * 删除热点问题
      */
     @DeleteMapping
-    public ResponseEntity<String> remove(@RequestParam String question) {
+    public ApiResponse<String> remove(@RequestParam String question) {
         hotCache.removeHotQuestion(question);
-        return ResponseEntity.ok("删除成功");
+        return ApiResponse.ok("删除成功");
     }
 
     /**
      * 列出当前所有热点问题
      */
     @GetMapping("/list")
-    public ResponseEntity<List<String>> list() {
-        return ResponseEntity.ok(hotCache.listHotQuestions());
+    public ApiResponse<List<String>> list() {
+        return ApiResponse.ok(hotCache.listHotQuestions());
     }
-
     /**
      * 查看缓存命中率统计
      */
     @GetMapping("/stats")
-    public ResponseEntity<String> stats() {
-        return ResponseEntity.ok(hotCache.getStats());
+    public ApiResponse<String> stats() {
+        return ApiResponse.ok(hotCache.getStats());
     }
-
     /**
      * 请求体 DTO
      */

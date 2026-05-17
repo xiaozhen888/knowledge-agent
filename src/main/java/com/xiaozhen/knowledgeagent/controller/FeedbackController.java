@@ -1,7 +1,9 @@
 package com.xiaozhen.knowledgeagent.controller;
 
+import com.xiaozhen.knowledgeagent.common.ApiResponse;
 import com.xiaozhen.knowledgeagent.model.Feedback;
 import com.xiaozhen.knowledgeagent.repository.FeedbackRepository;
+import com.xiaozhen.knowledgeagent.service.HotQuestionCacheService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.web.bind.annotation.*;
@@ -16,9 +18,10 @@ public class FeedbackController {
 
     private final FeedbackRepository feedbackRepository;
     private final RedisTemplate<String, String> redisTemplate;
+    private final HotQuestionCacheService hotQuestionCacheService;
 
     @PostMapping
-    public String submit(@RequestBody FeedbackRequest request) {
+    public ApiResponse<String> submit(@RequestBody FeedbackRequest request) {
         Feedback feedback = new Feedback(
                 request.getSessionId(),
                 request.getQuestion(),
@@ -27,22 +30,38 @@ public class FeedbackController {
         );
         feedbackRepository.save(feedback);
 
-        // 当收到 dislike 时，记录到 Redis，用于后续提示优化
         if ("dislike".equals(request.getRating())) {
+            String question = request.getQuestion().trim();
+            String sessionId = request.getSessionId();
+
+            String rerankKey = "rerank:" + question;
+            Boolean deletedRerank = redisTemplate.delete(rerankKey);
+            if (Boolean.TRUE.equals(deletedRerank)) {
+                System.out.println("用户点踩，已清除精排缓存: " + rerankKey);
+            }
+
+            String rewriteHash = String.valueOf(question.hashCode());
+            String embedKey = "embedding:query:" + sessionId + ":" + rewriteHash;
+            redisTemplate.delete(embedKey);
+
+            hotQuestionCacheService.removeHotQuestion(question);
+            System.out.println("用户点踩，已清除热点缓存: " + question);
+
             redisTemplate.opsForValue().set(
-                    "feedback:dislike:" + request.getSessionId(),
-                    "用户对问题「" + request.getQuestion() + "」的回答不满意。请重新思考，调整回答方式，或检查参考内容是否有遗漏。",
+                    "feedback:dislike:" + sessionId,
+                    "用户对问题「" + question + "」的回答不满意。请重新思考，调整回答方式，或检查参考内容是否有遗漏。",
                     30, TimeUnit.MINUTES
             );
         }
-        return "反馈已提交";
+
+        return ApiResponse.ok("反馈已提交");
     }
 
     @GetMapping("/stats")
-    public Map<String, Long> stats() {
+    public ApiResponse<Map<String, Long>> stats() {
         long likes = feedbackRepository.countByRating("like");
         long dislikes = feedbackRepository.countByRating("dislike");
-        return Map.of("likes", likes, "dislikes", dislikes);
+        return ApiResponse.ok(Map.of("likes", likes, "dislikes", dislikes));
     }
 
     public static class FeedbackRequest {
